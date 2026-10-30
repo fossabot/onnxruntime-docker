@@ -22,6 +22,11 @@
 3. ELF e_machine —— 产物是不是目标架构的机器码。QEMU 下构建时最容易踩的坑是
    cmake 的架构探测被 uname 骗了（在原生 arm64 runner 上跑 armv7 容器，uname
    仍报 aarch64），编译能过、产出的却是宿主架构的 .so。
+
+numpy 从 `Dockerfile.repackage` 的 wheelhouse 来时是「apk 重打包 + auditwheel 把
+libopenblas 收进 numpy.libs/」，所以额外做一次**线性代数**：`numpy.linalg.solve`
+是 LAPACK 调用，只有 libopenblas / libgfortran 真被 RPATH 找到并加载才可能算对；
+光 `import numpy` 只能证明 `.so` 被 mmap 了，证明不了 BLAS 可用。
 """
 
 import glob
@@ -183,6 +188,34 @@ def check_inference(onnxruntime):
     assert value == [3.0], "推理结果错误：期望 [3.0]，实际 %r" % (value,)
 
 
+def check_numpy():
+    """numpy 的三层检查：import、数组运算、LAPACK（libopenblas 是否真被加载）。"""
+    import numpy
+
+    print("numpy %s | 加载自 %s"
+          % (numpy.__version__, os.path.dirname(numpy.__file__)))
+
+    # 普通 ufunc 走 SIMD kernel，不碰 BLAS
+    assert float((numpy.arange(4.0) * 2).sum()) == 12.0, "numpy 基础运算错误"
+
+    # solve / svd 都落到 LAPACK（_umath_linalg -> libopenblas）。
+    # 自包含化做坏了（numpy.libs 没打进去、RPATH 不对）这里才会炸：
+    # ImportError: libopenblas.so.3: No such file or directory
+    a = numpy.array([[4.0, 1.0], [1.0, 3.0]])
+    b = numpy.array([1.0, 2.0])
+    x = numpy.linalg.solve(a, b)
+    assert numpy.allclose(a @ x, b), "numpy.linalg.solve 结果错误：%r" % (x,)
+
+    sv = numpy.linalg.svd(a, compute_uv=False)
+    print("线性代数: solve=%s | svd=%s | norm=%.6f"
+          % (numpy.round(x, 6).tolist(), numpy.round(sv, 6).tolist(),
+             numpy.linalg.norm(a)))
+    # 2x2 对称正定矩阵的奇异值可解析验证，防止「算出来是垃圾但没报错」
+    assert numpy.allclose(sv, [4.618033988749895, 2.381966011250105]), (
+        "numpy.linalg.svd 结果错误：%r（BLAS/LAPACK 有问题）" % (sv,)
+    )
+
+
 def main(argv):
     if len(argv) < 3:
         raise SystemExit("用法: python3 tests/smoke.py <平台> <期望版本>，"
@@ -192,6 +225,9 @@ def main(argv):
     print("== 环境 ==")
     print("python %s | %s | %s"
           % (platform.python_version(), platform.machine(), sys.platform))
+
+    print("== numpy / 线性代数 ==")
+    check_numpy()
 
     print("== import / 版本 / provider ==")
     onnxruntime = check_import(expected_version)
@@ -208,9 +244,14 @@ def main(argv):
 
     print("== 产物架构 ==")
     # 只校验 pybind 扩展与主库：这两个是编译产物，架构错了必然跑不起来
+    import numpy
+    np_dir = os.path.dirname(numpy.__file__)
     check_arch(platform_name, [
         os.path.join(capi, "onnxruntime_pybind11_state.so"),
         os.path.join(capi, "libonnxruntime.so*"),
+        # numpy 的扩展也是编译产物；重打包时若误用了宿主架构的包，这里会抓到
+        os.path.join(np_dir, "_core", "_multiarray_umath*.so"),
+        os.path.join(np_dir, "linalg", "_umath_linalg*.so"),
     ])
 
     print("== 真实推理 ==")

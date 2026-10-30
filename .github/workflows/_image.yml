@@ -1,20 +1,28 @@
 name: _Image (reusable)
 
-# onnxruntime wheel 流水线：构建 wheel → 发布 wheelhouse 镜像 → 逐平台冒烟。
+# onnxruntime 双出口流水线：每个平台同时产出 **wheelhouse 镜像** 与 **runtime 镜像**，
+# 逐平台冒烟，全绿且平台集合完整才分别合并两套 manifest 发布。
 #
-# Dockerfile 的 `wheel` 阶段是 `FROM scratch` + `/wheels`，所以「镜像」本身就是
-# wheel 的载体：发布模式把它按 digest 推到 Docker Hub，冒烟脚本再从 registry 取回
-# 同一份字节，保证「验的就是发的那份」。
+# Dockerfile.repackage 的两个出口 stage：
+#   * `--target wheel`   → `FROM scratch` + `/wheels`（onnxruntime + numpy 两个 wheel
+#                          与 SHA256SUMS）。镜像本身就是 wheel 的载体：按 digest 推送，
+#                          使用者 `docker create` + `docker cp` 即可取出同一份字节。
+#   * `--target runtime` → 可直接运行的镜像（python3 + uv + 已装好的 onnxruntime/numpy，
+#                          里面**没有** /wheels）。这是使用者 `FROM` 的基座。
 #
 # 阶段划分（与 pycurl-docker / ddddocr 一致的四段解耦）：
 #   1) plan   ：算出构建分组、冒烟矩阵、平台全集与「是否全量」，下游只吃 outputs
-#   2) build  ：每个平台一个 job，各自在自己的 runner 上编译（组间并行）；
-#               发布模式 push-by-digest（不产任何中间 tag），非发布模式产 wheel 目录
-#   3) smoke  ：每个平台一个 job，在**干净的 alpine** 里装 wheel 并真跑推理
-#   4) publish：全部构建 + 全部冒烟通过、且平台集合完整，才合并 manifest 打正式 tag
+#   2) build  ：每个平台一个 job，一次编译两个出口（repack 阶段共享，不重复编译）；
+#               发布模式两个出口各自 push-by-digest（不产任何中间 tag）
+#   3) smoke  ：每个平台一个 job，**直接跑 runtime 镜像**（不是在干净 alpine 里重装
+#               wheel），验的是「使用者拿到的那个镜像本身」
+#   4) publish：全部构建 + 全部冒烟通过、且平台集合完整，才分别合并 wheelhouse 与
+#               runtime 两套 manifest，各打两个 tag
 #
-# 为什么构建与冒烟分成两个 job：编译失败与运行时失败是两种独立信号；且冒烟机
-# 只需要一个几 MB 的 wheel，不必再占一台能编译 onnxruntime 的大机器。
+# 为什么冒烟跑 runtime 镜像而不重装 wheel：runtime 镜像里 numpy 是从本地 wheelhouse
+# 用 `--no-index --find-links` 装的，所以它跑通就同时证明了两件事 —— wheel 在干净
+# musl 环境里能装（RPATH / DT_NEEDED / .libs 自包含化正确），以及最终镜像可运行。
+# 反过来在外部重装只能证明前者。
 on:
   workflow_call:
     inputs:
@@ -23,7 +31,7 @@ on:
         type: boolean
         default: false
       platforms:
-        description: '平台子集（空 = 默认平台集合）'
+        description: '平台子集（空 = 默认 6 平台）。子集禁止发布'
         type: string
         default: ''
       apk_mirror:
@@ -35,15 +43,19 @@ on:
         type: string
         default: '3.24'
       onnx_version:
-        description: 'onnxruntime 版本'
+        description: 'onnxruntime 版本（同时是 runtime 镜像的 tag）'
         type: string
         default: '1.24.4'
+      numpy_version:
+        description: 'numpy 版本（决定 wheelhouse 里那个 numpy wheel）'
+        type: string
+        default: '2.4.6'
       native_arm:
         description: '用 GitHub 原生 arm64 runner 构建 arm64（比 QEMU 快一个数量级）'
         type: boolean
         default: true
       dockerfile:
-        description: '用哪份 Dockerfile 构建 wheel'
+        description: '用哪份 Dockerfile 构建'
         type: string
         default: 'Dockerfile.repackage'
       cache_bust:
@@ -59,10 +71,19 @@ on:
 env:
   PUBLISH: ${{ inputs.push || startsWith(github.ref, 'refs/tags/') }}
   IMAGE: docker.io/a76yyyy/onnxruntime
-  # 默认只跑三大主流架构：原生 runner 能编译 amd64/arm64，armv7 靠 QEMU 但耗时
-  # 还算可控。ppc64le / riscv64 只能在 QEMU 下全量编译（单平台数小时），风险高，
-  # 留作显式输入按需加。
-  DEFAULT_PLATFORMS: linux/amd64,linux/arm64,linux/arm/v7
+  # 默认平台 = 可用平台全集。这 6 个是实测「apk 有 py3-onnxruntime + py3-numpy，
+  # 且 numpy 线性代数在干净镜像里可用」的组合。
+  #
+  # 刻意不含：
+  #   * 386 / s390x —— Alpine 官方 onnxruntime 配方 arch="all !s390x !x86"，
+  #                    py3-onnxruntime 根本不存在；
+  #   * arm/v6      —— armhf 分支只出 base 包，Python 绑定被 py3-flatbuffers 挡住；
+  #   * loong64     —— 在列表里，但 alpine 官方没有该架构，plan 会为它注入
+  #                    base_image=ghcr.io/loong64/alpine（同仓库有同版本 py3-onnxruntime）。
+  # ddddocr 自己标注 386 / armv6 / s390x 不支持 OCR，填了也会在 Dockerfile 里 fail-fast。
+  DEFAULT_PLATFORMS: linux/amd64,linux/arm64,linux/arm/v7,linux/ppc64le,linux/riscv64,linux/loong64
+  # loong64 专用基座（官方 alpine 无此架构）
+  LOONG64_BASE: ghcr.io/loong64/alpine
 
 jobs:
   plan:
@@ -83,6 +104,8 @@ jobs:
         env:
           PLATFORM_INPUT: ${{ inputs.platforms }}
           NATIVE_ARM: ${{ inputs.native_arm && 'true' || 'false' }}
+          ALPINE: ${{ inputs.alpine_version }}
+          LOONG64_BASE: ${{ env.LOONG64_BASE }}
         run: |
           # 必须 -e：下面 python 用 sys.exit("::error::...") 报错，没有 -e 时
           # 脚本会带着半截 matrix 继续往下跑，真正的错误要到下游 job 才暴露
@@ -94,53 +117,72 @@ jobs:
           raw = (os.environ.get("PLATFORM_INPUT") or "").strip()
           plats = [p.strip() for p in raw.split(",") if p.strip()] if raw else default
 
-          # 可选平台 = alpine:3.24 官方有变体、且 onnxruntime 上游支持编译的架构。
-          # 刻意不列 386 / s390x（onnxruntime 不支持，见 README 的 Tips）与 loong64
-          # （alpine 官方无该变体，要发布得先换基座镜像）。ppc64le / riscv64 只靠
-          # QEMU 全量编译，单平台数小时，只在确实需要时手动指定。
+          # 可选平台 = 实测通过的 6 个。加新平台前必须先确认两件事：
+          #   1) 该架构的 alpine 源里有 py3-onnxruntime 与 py3-numpy（或像 loong64
+          #      那样换一个同版本的基座仓库）；
+          #   2) tests/smoke.py 的 ELF_MACHINE 里有它的 e_machine 编码。
           allowed = {"linux/amd64", "linux/arm64", "linux/arm/v7",
-                     "linux/arm/v6", "linux/ppc64le", "linux/riscv64"}
+                     "linux/ppc64le", "linux/riscv64", "linux/loong64"}
           bad = [p for p in plats if p not in allowed]
           if bad:
-              sys.exit("::error::未知平台: %s（可选: %s）" % (",".join(bad), ",".join(sorted(allowed))))
+              sys.exit("::error::不支持或未验证的平台: %s（可选: %s）"
+                       % (",".join(bad), ",".join(sorted(allowed))))
           dup = sorted({p for p in plats if plats.count(p) > 1})
           if dup:
               sys.exit("::error::平台重复: %s" % ",".join(dup))
 
           arm_runner = "ubuntu-24.04-arm" if os.environ.get("NATIVE_ARM") == "true" else "ubuntu-latest"
 
-          # 一个平台一个 build job。刻意不把多个平台塞进同一个 buildx 调用：
-          #   * onnxruntime 是重编译（4 核 runner 上 amd64 约 19 分钟），两平台并行会 OOM；
-          #   * 单平台构建的 local 导出直接落在 dest 根目录，不必按平台分子目录；
-          #   * 单平台 push-by-digest 得到的是单平台 manifest digest，冒烟可以直接
-          #     按 digest 取回同一份字节，不必赌多平台 index 的选择逻辑。
+          # wheel 文件名里的架构串（pack_wheel.py 用 uname -m 的值）。容器 tag /
+          # 日志里用它，避免再有地方把 arm/v7 写成 arm-v7 而和 wheel 名对不上。
+          arch_map = {
+              "linux/amd64": "amd64",
+              "linux/arm64": "arm64",
+              "linux/arm/v7": "armv7l",
+              "linux/ppc64le": "ppc64le",
+              "linux/riscv64": "riscv64",
+              "linux/loong64": "loong64",
+          }
+
+          # 只有 loong64 需要换基座：alpine 官方没有该架构，ghcr.io/loong64/alpine
+          # 有同 Alpine 版本、同 py3-onnxruntime / py3-numpy。空字符串 = 用
+          # Dockerfile 里的默认 ${BASE_IMAGE}=alpine:${ALPINE_VERSION}。
+          def base_of(p):
+              if p == "linux/loong64":
+                  return "%s:%s" % (os.environ["LOONG64_BASE"], os.environ["ALPINE"])
+              return ""
+
+          # 一个平台一个 job，一个 job 里连着 build 两个 target：
+          #   * onnxruntime 重编译（repackage 路径是秒级，源码路径 amd64 约 19 分钟），
+          #     两平台并进同一个 buildx 调用会 OOM；
+          #   * 两个 target 共用 `repack` 阶段，同一 builder 里第二次直接命中本地缓存，
+          #     拆成两个 job 反而会把它编译两遍；
+          #   * 单平台 push-by-digest 得到的是单平台 manifest digest，发布时按平台
+          #     逐一合并，冒烟也能按 digest 取回同一份字节。
           def group_of(p):
               return p.replace("linux/", "").replace("/", "-")
 
           def runner_of(p):
               return arm_runner if p == "linux/arm64" else "ubuntu-latest"
 
-          include = [{
-              "platform": p,
-              "group": group_of(p),
-              "runner": runner_of(p),
-          } for p in plats]
+          def entry(p):
+              return {
+                  "platform": p,
+                  "group": group_of(p),
+                  "arch": arch_map[p],
+                  "runner": runner_of(p),
+                  "base_image": base_of(p),
+              }
 
-          smoke = [{
-              "platform": p,
-              "group": group_of(p),
-              "runner": runner_of(p),
-          } for p in plats]
+          include = [entry(p) for p in plats]
 
           print("matrix=" + json.dumps({"include": include}))
-          print("smoke_matrix=" + json.dumps({"include": smoke}))
+          print("smoke_matrix=" + json.dumps({"include": include}))
           print("expected=" + ",".join(sorted(plats)))
           print("full=%s" % str(sorted(plats) == sorted(default)).lower())
           PY
           echo "--- 构建矩阵 ---"
           sed -n 's/^matrix=//p' /tmp/plan.out | python3 -m json.tool
-          echo "--- 冒烟矩阵 ---"
-          sed -n 's/^smoke_matrix=//p' /tmp/plan.out | python3 -m json.tool
           echo "--- 其余 ---"
           grep -Ev '^(matrix|smoke_matrix)=' /tmp/plan.out
           cat /tmp/plan.out >> "$GITHUB_OUTPUT"
@@ -149,8 +191,8 @@ jobs:
     needs: plan
     name: Build ${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
-    # 原生架构实测约 19 分钟；armv7 / riscv64 等要在 QEMU 下单步模拟编译，
-    # 可能数小时。给到 GitHub 单 job 上限附近，避免慢架构被超时误杀。
+    # 原生架构 repackage 约 1 分钟；QEMU 架构要模拟 apk 安装 + auditwheel，
+    # 给到 GitHub 单 job 上限附近，避免慢架构被超时误杀
     timeout-minutes: 360
     permissions:
       contents: read
@@ -160,8 +202,25 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Guard - dockerfile exposes both exits
+        # 双出口流水线要求 Dockerfile 同时有 `wheel` 与 `runtime` 两个 stage，
+        # 缺一个时 buildx 只会报 "target stage ... could not be found"，看不懂；
+        # 这里提前给出明确错误（当前只有 Dockerfile.repackage 满足）
+        env:
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        run: |
+          set -euo pipefail
+          for stage in wheel runtime; do
+            if ! grep -qE "^FROM[[:space:]].*[[:space:]]AS[[:space:]]+${stage}[[:space:]]*$" "$DOCKERFILE"; then
+              echo "::error::${DOCKERFILE} 没有 \`AS ${stage}\` 出口 stage，双出口流水线无法构建。"
+              echo "::error::wheel 出口用于产出 wheelhouse 镜像，runtime 出口用于产出可运行镜像与冒烟。"
+              exit 1
+            fi
+          done
+          echo "出口 stage 齐全（wheel + runtime）"
       - name: Set up QEMU
-        # 非本机架构（如 ubuntu-latest 上的 armv7）要靠 binfmt 才能执行 RUN 里的编译
+        # 非本机架构（如 ubuntu-latest 上的 riscv64）要靠 binfmt 才能执行 RUN 里的
+        # apk / python
         uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -172,45 +231,103 @@ jobs:
           registry: docker.io
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
-      - name: Build wheel image
-        id: build
+      - name: Compute build args
+        id: args
+        # 不能直接把 BASE_IMAGE 写进 build-args：非 loong64 平台该值为空，
+        # 而空的 `FROM ` 会直接报错。这里只在需要时追加这一行。
+        env:
+          BASE_IMAGE: ${{ matrix.base_image }}
+          ALPINE: ${{ inputs.alpine_version }}
+          ONNX: ${{ inputs.onnx_version }}
+          NUMPY: ${{ inputs.numpy_version }}
+          APK_MIRROR: ${{ inputs.apk_mirror }}
+        run: |
+          set -euo pipefail
+          {
+            echo "build_args<<__BUILD_ARGS__"
+            echo "ALPINE_VERSION=${ALPINE}"
+            echo "ONNX_VERSION=${ONNX}"
+            echo "NUMPY_VERSION=${NUMPY}"
+            echo "APK_MIRROR=${APK_MIRROR}"
+            if [ -n "${BASE_IMAGE}" ]; then
+              echo "BASE_IMAGE=${BASE_IMAGE}"
+            fi
+            echo "__BUILD_ARGS__"
+          } >> "$GITHUB_OUTPUT"
+          echo "构建参数：ALPINE_VERSION=${ALPINE} ONNX_VERSION=${ONNX} NUMPY_VERSION=${NUMPY} BASE_IMAGE=${BASE_IMAGE:-（默认）}"
+      - name: Build wheelhouse image
+        id: wheelhouse
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./${{ inputs.dockerfile }}
-          # 只到 wheel 阶段：后面没有运行时镜像，产物就是这个 scratch 镜像里的 /wheels
+          # 只到 wheel 阶段：产物就是这个 scratch 镜像里的 /wheels
           target: wheel
           platforms: ${{ matrix.platform }}
           # 发布模式按 digest 推送：各平台并行构建，用 digest 传递产物不必协调 tag
           # 命名，也不在 tag 列表里留下对使用者无意义、却可被拉取的中间产物。
-          # 非发布模式落盘，供同一次运行的冒烟 job 直接取用。
-          push: ${{ env.PUBLISH == 'true' }}
-          outputs: ${{ env.PUBLISH == 'true' && format('type=image,name={0},push-by-digest=true,name-canonical=true', 'docker.io/a76yyyy/onnxruntime') || 'type=local,dest=./dist' }}
-          build-args: |
-            ALPINE_VERSION=${{ inputs.alpine_version }}
-            ONNX_VERSION=${{ inputs.onnx_version }}
-            APK_MIRROR=${{ inputs.apk_mirror }}
+          # 非发布模式落盘，作为 wheel 产物留给人工取用。
+          #
+          # 推送开关写在 outputs 里（push=true），不用 action 的 push 输入：这样只有
+          # 一条 `--output`，不会出现「--push 又叠加一个 type=image」的二义性。
+          # 实测：`type=image,...,push-by-digest=true,name-canonical=true` 不带
+          # push=true 时只写本地镜像库、**不会**推送，加其余参数是必需的。
+          outputs: ${{ env.PUBLISH == 'true' && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.IMAGE) || 'type=local,dest=./dist' }}
+          build-args: ${{ steps.args.outputs.build_args }}
           # 不产 attestation 清单，保持 manifest 只有平台条目（旧客户端兼容）
           provenance: false
           cache-from: type=gha,scope=onnx-${{ matrix.group }}${{ inputs.cache_bust }}
           cache-to: type=gha,mode=max,scope=onnx-${{ matrix.group }}${{ inputs.cache_bust }},ignore-error=true
+      - name: Build runtime image
+        if: env.PUBLISH == 'true'
+        id: runtime
+        # 发布模式才在这里构建：非发布模式下冒烟 job 会自己 `--load` 出来跑，
+        # 避免同一台 runner 上编译两遍（repack 阶段仍然从缓存命中）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./${{ inputs.dockerfile }}
+          target: runtime
+          platforms: ${{ matrix.platform }}
+          # 与上面 wheelhouse 一步完全同构（此步只在发布模式跑）：两个出口各自
+          # 拿到独立的单平台 digest
+          outputs: ${{ format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.IMAGE) }}
+          build-args: ${{ steps.args.outputs.build_args }}
+          provenance: false
+          # 第一条来自上面 wheelhouse 的导出（复用 repack 阶段），第二条是本 target
+          cache-from: |
+            type=gha,scope=onnx-${{ matrix.group }}${{ inputs.cache_bust }}
+            type=gha,scope=onnx-${{ matrix.group }}-runtime${{ inputs.cache_bust }}
+          cache-to: type=gha,mode=max,scope=onnx-${{ matrix.group }}-runtime${{ inputs.cache_bust }},ignore-error=true
       - name: Show wheel
         if: env.PUBLISH != 'true'
         # 顺带把 SHA256SUMS 打进日志：artifact 里存的就是这份清单，出问题时可追溯
         run: ls -l dist/wheels && cat dist/wheels/SHA256SUMS
-      - name: Export digest
+      - name: Export digests
         if: env.PUBLISH == 'true'
+        # 两个出口各一个 digest，分开目录存放，artifact 名也带出口名，
+        # 下游 publish 才能把两套 manifest 各自的 6 个 digest 分清楚
         run: |
           set -eu
-          mkdir -p /tmp/digests
-          echo "${{ steps.build.outputs.digest }}" > "/tmp/digests/${{ matrix.group }}.digest"
-          echo "digest: $(cat "/tmp/digests/${{ matrix.group }}.digest")"
-      - name: Upload digest
+          mkdir -p /tmp/digests/wheelhouse /tmp/digests/runtime
+          echo "${{ steps.wheelhouse.outputs.digest }}" > "/tmp/digests/wheelhouse/${{ matrix.group }}.digest"
+          echo "${{ steps.runtime.outputs.digest }}" > "/tmp/digests/runtime/${{ matrix.group }}.digest"
+          echo "wheelhouse ${{ matrix.group }}: $(cat "/tmp/digests/wheelhouse/${{ matrix.group }}.digest")"
+          echo "runtime    ${{ matrix.group }}: $(cat "/tmp/digests/runtime/${{ matrix.group }}.digest")"
+      - name: Upload wheelhouse digest
         if: env.PUBLISH == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: digest-${{ matrix.group }}
-          path: /tmp/digests/*.digest
+          name: digest-wheelhouse-${{ matrix.group }}
+          path: /tmp/digests/wheelhouse/*.digest
+          retention-days: 1
+          if-no-files-found: error
+      - name: Upload runtime digest
+        if: env.PUBLISH == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-runtime-${{ matrix.group }}
+          path: /tmp/digests/runtime/*.digest
           retention-days: 1
           if-no-files-found: error
       - name: Upload wheel
@@ -227,8 +344,8 @@ jobs:
     needs: [plan, build]
     name: Smoke ${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
-    # 装 wheel + 跑一次推理，本机架构是秒级；QEMU 下解压 15MiB wheel、
-    # 加载 20MiB 主库都要放大十几倍，留足余量
+    # 直接跑已装好包的镜像，本机架构是秒级；QEMU 下 import numpy + 建 Session
+    # 要放大十几倍，留足余量
     timeout-minutes: 90
     if: ${{ needs.build.result == 'success' }}
     permissions:
@@ -241,66 +358,79 @@ jobs:
         # 冒烟脚本本体在仓库里（tests/smoke.py），挂进容器执行
         uses: actions/checkout@v4
       - name: Set up QEMU
-        # 冒烟容器要按目标架构真跑（armv7 在 x86 runner 上全靠 binfmt）
+        # 冒烟容器要按目标架构真跑（riscv64 / loong64 在 x86 runner 上全靠 binfmt）
         uses: docker/setup-qemu-action@v3
-      - name: Download digest
-        if: env.PUBLISH == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          name: digest-${{ matrix.group }}
-          path: /tmp/digest
-      - name: Download wheel
+      - name: Set up Docker Buildx
         if: env.PUBLISH != 'true'
+        uses: docker/setup-buildx-action@v3
+      - name: Compute build args
+        if: env.PUBLISH != 'true'
+        id: args
+        env:
+          BASE_IMAGE: ${{ matrix.base_image }}
+          ALPINE: ${{ inputs.alpine_version }}
+          ONNX: ${{ inputs.onnx_version }}
+          NUMPY: ${{ inputs.numpy_version }}
+          APK_MIRROR: ${{ inputs.apk_mirror }}
+        run: |
+          set -euo pipefail
+          {
+            echo "build_args<<__BUILD_ARGS__"
+            echo "ALPINE_VERSION=${ALPINE}"
+            echo "ONNX_VERSION=${ONNX}"
+            echo "NUMPY_VERSION=${NUMPY}"
+            echo "APK_MIRROR=${APK_MIRROR}"
+            if [ -n "${BASE_IMAGE}" ]; then
+              echo "BASE_IMAGE=${BASE_IMAGE}"
+            fi
+            echo "__BUILD_ARGS__"
+          } >> "$GITHUB_OUTPUT"
+      - name: Download runtime digest
+        if: env.PUBLISH == 'true'
         uses: actions/download-artifact@v4
         with:
-          name: wheel-${{ matrix.group }}
-          path: dist/wheels
-      - name: Fetch wheel from registry
+          name: digest-runtime-${{ matrix.group }}
+          path: /tmp/digest
+      - name: Fetch runtime image from registry
         if: env.PUBLISH == 'true'
-        # 发布模式下验的就是 registry 里那份字节，而不是构建机上残留的临时文件
+        # 发布模式下验的就是 registry 里那份字节，而不是构建机上残留的临时镜像
         run: |
           set -eux
           DIGEST=$(cat /tmp/digest/*.digest)
           docker pull --platform "${{ matrix.platform }}" "${IMAGE}@${DIGEST}"
-          # wheel 阶段是 FROM scratch，镜像没有 Cmd，`docker create` 必须显式给一个
-          # 命令才不报 "no command specified"；容器根本不会启动，命令本身无所谓
-          docker create --name wheelhouse "${IMAGE}@${DIGEST}" /nonexistent
-          mkdir -p dist/wheels
-          docker cp wheelhouse:/wheels/. dist/wheels/
-          docker rm wheelhouse
-          ls -l dist/wheels
-      - name: Install wheel and run smoke
+          docker tag "${IMAGE}@${DIGEST}" "smoke:${{ matrix.arch }}"
+          docker image inspect -f '{{.Id}}' "smoke:${{ matrix.arch }}"
+      - name: Build runtime image
+        if: env.PUBLISH != 'true'
+        # 非发布模式没有 registry 可拉，就地按同一个 target 构建并装进本地 docker。
+        # repack 阶段命中 build job 导出的 gha 缓存，不会重跑 auditwheel。
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./${{ inputs.dockerfile }}
+          target: runtime
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: smoke:${{ matrix.arch }}
+          build-args: ${{ steps.args.outputs.build_args }}
+          provenance: false
+          cache-from: |
+            type=gha,scope=onnx-${{ matrix.group }}${{ inputs.cache_bust }}
+            type=gha,scope=onnx-${{ matrix.group }}-runtime${{ inputs.cache_bust }}
+          cache-to: type=gha,mode=max,scope=onnx-${{ matrix.group }}-runtime${{ inputs.cache_bust }},ignore-error=true
+      - name: Run smoke in runtime image
         env:
-          APK_MIRROR: ${{ inputs.apk_mirror }}
-          ALPINE: ${{ inputs.alpine_version }}
           PLATFORM: ${{ matrix.platform }}
           VERSION: ${{ inputs.onnx_version }}
+        # smoke.py 会验：环境架构、numpy 版本 + 线性代数（solve/svd/norm）、
+        # onnxruntime 版本 + provider、4 个产物的 ELF 架构、一次真实推理
         run: |
           set -euo pipefail
           docker run --rm \
             --platform "$PLATFORM" \
-            -e APK_MIRROR="$APK_MIRROR" \
-            -e PLATFORM="$PLATFORM" \
-            -e VERSION="$VERSION" \
-            -v "$PWD/dist/wheels:/wheels:ro" \
             -v "$PWD/tests:/tests:ro" \
-            "alpine:$ALPINE" sh -euc '
-              if [ -n "${APK_MIRROR:-}" ]; then
-                sed -i "s|https://dl-cdn.alpinelinux.org|${APK_MIRROR%/}|g" /etc/apk/repositories
-              fi
-              apk add --no-cache python3 uv
-              cd /wheels && sha256sum -c SHA256SUMS
-              # 首选让 uv 从 PyPI 解析全部依赖：连 Requires-Dist 是否可满足一起验了
-              if ! uv pip install --system --break-system-packages /wheels/*.whl; then
-                # numpy 只为 x86_64 / aarch64 出 cp314 的 musllinux 轮子，armv7 /
-                # ppc64le / riscv64 上 uv 会退回源码编译而失败。这些架构改用 apk 的
-                # 预编译 numpy：uv 看到 numpy 已满足，只解析剩下的纯 python 依赖。
-                echo "::warning::PyPI 无可用的 numpy 二进制轮子，改用 apk py3-numpy 后重试"
-                apk add --no-cache py3-numpy
-                uv pip install --system --break-system-packages /wheels/*.whl
-              fi
-              python3 /tests/smoke.py "$PLATFORM" "$VERSION"
-            '
+            "smoke:${{ matrix.arch }}" \
+            python3 /tests/smoke.py "$PLATFORM" "$VERSION"
 
   publish:
     needs: [plan, build, smoke]
@@ -317,15 +447,37 @@ jobs:
         if: ${{ needs.plan.outputs.full != 'true' }}
         run: |
           echo "::error::平台子集（${{ needs.plan.outputs.expected }}）不是完整平台集合，禁止发布。"
-          echo "::error::用子集发布会把多平台正式 manifest 覆盖成不完整版本。"
+          echo "::error::用子集发布会把两套多平台 manifest 都覆盖成不完整版本。"
           echo "::error::要发布请留空 platforms 走全平台构建。"
           exit 1
-      - name: Download digests
+      - name: Download wheelhouse digests
         uses: actions/download-artifact@v4
         with:
-          pattern: digest-*
-          path: /tmp/digests
+          pattern: digest-wheelhouse-*
+          path: /tmp/digests/wheelhouse
           merge-multiple: true
+      - name: Download runtime digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digest-runtime-*
+          path: /tmp/digests/runtime
+          merge-multiple: true
+      - name: Guard - digest completeness
+        env:
+          EXPECTED: ${{ needs.plan.outputs.expected }}
+        # artifact 会跨 job 传递，缺一个平台就会静默合并出残缺 index（历史上踩过），
+        # 所以合并前先按平台数核对一遍
+        run: |
+          set -euo pipefail
+          want=$(printf '%s' "$EXPECTED" | tr ',' '\n' | grep -c . )
+          for kind in wheelhouse runtime; do
+            got=$(find "/tmp/digests/$kind" -name '*.digest' | grep -c . || true)
+            echo "$kind: $got / $want digest"
+            if [ "$got" -ne "$want" ]; then
+              echo "::error::$kind 的 digest 不完整（${got} != ${want}），禁止发布"
+              exit 1
+            fi
+          done
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Login to Docker Hub
@@ -339,21 +491,29 @@ jobs:
           VERSION: ${{ inputs.onnx_version }}
         run: |
           set -euo pipefail
-          SRCS=""
-          for f in /tmp/digests/*.digest; do
-            SRCS="$SRCS ${IMAGE}@$(cat "$f")"
-          done
-          echo "聚合来源:${SRCS}"
+          # 两个出口各自合并，绝不混在一起：wheelhouse 是 scratch + /wheels，
+          # runtime 是带 python 的基座镜像，混着合会得到一个既不能跑也没有 /wheels
+          # 的怪东西
+          merge_one() {
+            dir="$1"; shift
+            SRCS=""
+            for f in "$dir"/*.digest; do
+              SRCS="$SRCS ${IMAGE}@$(cat "$f")"
+            done
+            echo "聚合来源 $dir:${SRCS}"
+            for TAG in "$@"; do
+              echo "::group::合并 -> ${IMAGE}:${TAG}"
+              docker buildx imagetools create -t "${IMAGE}:${TAG}" $SRCS
+              echo "::endgroup::"
+            done
+          }
 
-          # 两个 tag 都是确定性的：版本号来自输入（与 Dockerfile 的 ONNX_VERSION
-          # 同源），latest 是滚动 tag。tag 事件与 dispatch 发布走的是同一套命名。
-          TAGS="${VERSION} latest"
-          for TAG in $TAGS; do
-            echo "::group::合并 -> ${IMAGE}:${TAG}"
-            docker buildx imagetools create -t "${IMAGE}:${TAG}" $SRCS
-            echo "::endgroup::"
-          done
-          echo "TAGS=$TAGS" >> "$GITHUB_ENV"
+          # tag 命名是确定性的（版本号来自输入，与 Dockerfile 的 ONNX_VERSION 同源）：
+          #   1.24.4-wheelhouse / wheelhouse  -> wheel 载体（滚动 tag 指向最新 wheelhouse）
+          #   1.24.4 / latest                 -> 可运行镜像
+          merge_one /tmp/digests/wheelhouse "${VERSION}-wheelhouse" wheelhouse
+          merge_one /tmp/digests/runtime    "${VERSION}" latest
+          echo "TAGS=${VERSION}-wheelhouse wheelhouse ${VERSION} latest" >> "$GITHUB_ENV"
       - name: Verify manifest platform completeness
         env:
           EXPECTED: ${{ needs.plan.outputs.expected }}

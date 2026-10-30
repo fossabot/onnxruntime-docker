@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""把 onnxruntime 变成「自包含 wheel」。两条入口共用同一套组装逻辑：
+"""把 apk / 源码里的某个包变成「自包含 wheel」。两条入口共用同一套组装逻辑：
 
 * ``--wheel-dir``（源码路径，Dockerfile 用）：吃 setup.py ``bdist_wheel`` 的产物，
   补齐 capi 里的库、解软链，再交给 auditwheel 修复后重新打包。
-* ``--from-apk``（重打包路径，Dockerfile.repackage 用）：直接吃 Alpine 官方
-  ``py3-onnxruntime`` 装进 site-packages 的目录树，组装成 wheel 树后修复打包。
+* ``--from-apk``（重打包路径，Dockerfile.repackage 用）：直接吃 Alpine 官方包
+  装进 site-packages 的目录树（``--package`` 指定包名，默认 onnxruntime），
+  组装成 wheel 树后修复打包。目前已用于 onnxruntime 与 numpy。
 
 依赖收集（DT_NEEDED 递归闭包）与 RPATH 全部交给 ``auditwheel repair``：
 它会把 abseil / re2 / protobuf / icu 这类非系统库改名塞进 ``onnxruntime.libs/``，
 把每个 ELF 的 RPATH 设成 ``$ORIGIN:$ORIGIN/../../onnxruntime.libs``，并把标签
 从 ``linux_<arch>`` 改成 ``musllinux_1_2_<arch>``。因此本脚本只保留三件它做不到
-或不该由它做的事：
+或不该由它做的事（**仅 onnxruntime**，见 ``prepare_capi``；其它包如 numpy 的 .so
+是包内真文件，直接原样交给 auditwheel，它会把 libopenblas 之类收进
+``numpy.libs/``）：
 
 1. 解引用软链。alpine 的包是这样装的：``libonnxruntime.so.1.24.4`` 和
    ``libonnxruntime_providers_shared.so`` 放在 ``/usr/lib``，python 目录里的
@@ -131,7 +134,7 @@ def prepare_capi(capi: Path, extra_dirs: list[Path]) -> None:
 # 打包 + 修复
 # --------------------------------------------------------------------------- #
 def auditwheel_repair(raw_wheel: Path, out_dir: Path) -> None:
-    """让 auditwheel 收集 DT_NEEDED 闭包、改名入 onnxruntime.libs/、改 RPATH、重打标签。
+    """让 auditwheel 收集 DT_NEEDED 闭包、改名入 <pkg>.libs/、改 RPATH、重打标签。
 
     必须在**装了这些库的构建镜像**里跑：auditwheel 靠遍历 musl 的搜索路径
     （/lib、/usr/lib、LD_LIBRARY_PATH）去定位每个 NEEDED，找不到就直接
@@ -148,26 +151,35 @@ def auditwheel_repair(raw_wheel: Path, out_dir: Path) -> None:
     )
 
 
-def report(wheel: Path) -> None:
-    """打印产物与各目录的库清单（CI 日志里用来快速核对，不做断言）。"""
+def report(wheel: Path, package: str) -> None:
+    """打印产物与 auditwheel 收进来的依赖库清单（CI 日志里快速核对，不做断言）。"""
     print(f"\n产物: {wheel.name}")
     print(f"大小: {wheel.stat().st_size / 1024 / 1024:.1f} MiB")
     with zipfile.ZipFile(wheel) as zf:
         entries = [(i.filename, i.file_size) for i in zf.infolist() if ".so" in i.filename]
-    for prefix in ("onnxruntime/capi/", "onnxruntime.libs/"):
-        libs = sorted((e for e in entries if e[0].startswith(prefix)), key=lambda e: -e[1])
-        print(f"{prefix}库数量: {len(libs)}")
-        for name, size in libs:
-            if size >= 1024 * 1024:
-                print(f"  {name[len(prefix):]:48s} {size / 1024 / 1024:8.2f} MiB")
+
+    libs_prefix = f"{package}.libs/"
+    bundled = sorted((e for e in entries if e[0].startswith(libs_prefix)), key=lambda e: -e[1])
+    print(f"{libs_prefix} 库数量: {len(bundled)}")
+    for name, size in bundled:
+        print(f"  {name[len(libs_prefix):]:48s} {size / 1024 / 1024:8.2f} MiB")
+
+    own = sorted((e for e in entries if not e[0].startswith(libs_prefix)), key=lambda e: -e[1])
+    print(f"{package}/ 里 .so 数量: {len(own)}")
+    for name, size in own:
+        if size >= 1024 * 1024:
+            print(f"  {name:48s} {size / 1024 / 1024:8.2f} MiB")
 
 
-def pack_tree(unroot: Path, out_dir: Path) -> Path:
+def pack_tree(unroot: Path, out_dir: Path, package: str) -> Path:
     """把组装好的 wheel 树打成 wheel，再交给 auditwheel 修复，返回最终产物。"""
     out_dir.mkdir(parents=True, exist_ok=True)
     # 中间产物必须落在 out_dir 之外：CI 用 --output type=local 把整个目录取走，
     # 两个 wheel 混在一起会让下游的 *.whl 通配符装错文件。
     staging = Path(tempfile.mkdtemp(prefix="ortraw-"))
+    # out_dir 里可能已经有别的包的 wheel（先打 numpy、再打 onnxruntime），
+    # 所以用「新增了哪个」来判断本次产物，而不是断言目录里恰好 1 个。
+    before = {p.resolve() for p in out_dir.glob("*.whl")}
     try:
         subprocess.run(
             [sys.executable, "-m", "wheel", "pack", str(unroot), "--dest-dir", str(staging)],
@@ -178,11 +190,11 @@ def pack_tree(unroot: Path, out_dir: Path) -> Path:
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
-    wheels = sorted(out_dir.glob("*.whl"))
-    if len(wheels) != 1:
-        raise SystemExit(f"错误: 期望 {out_dir} 里恰好 1 个 wheel, 实际 {wheels}")
-    report(wheels[0])
-    return wheels[0]
+    produced = sorted({p.resolve() for p in out_dir.glob("*.whl")} - before)
+    if len(produced) != 1:
+        raise SystemExit(f"错误: 期望 {out_dir} 里新增恰好 1 个 wheel, 实际 {produced}")
+    report(produced[0], package)
+    return produced[0]
 
 
 def from_source_wheel(wheel_dir: Path, out_dir: Path, extra_dirs: list[Path]) -> int:
@@ -212,7 +224,7 @@ def from_source_wheel(wheel_dir: Path, out_dir: Path, extra_dirs: list[Path]) ->
                     shutil.copyfile(src, capi / src.name)
 
         prepare_capi(capi, extra_dirs)
-        pack_tree(unroot, out_dir)
+        pack_tree(unroot, out_dir, "onnxruntime")
         return 0
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -231,27 +243,40 @@ def copy_package(src: Path, dst: Path) -> None:
     )
 
 
-def write_dist_info(unroot: Path, egg_info: Path, version: str, plat_name: str) -> Path:
-    """用 apk 里的 egg-info 元数据生成 wheel 的 dist-info 目录。"""
-    major, minor = sys.version_info[:2]
-    tag = f"cp{major}{minor}-cp{major}{minor}-{plat_name}"
-    dist_info = unroot / f"onnxruntime-{version}.dist-info"
-    dist_info.mkdir(parents=True, exist_ok=True)
+def normalize_name(name: str) -> str:
+    """PEP 503 归一化：dist-info 目录名里 name 与 version 用 ``-`` 分隔。"""
+    return re.sub(r"[-_.]+", "_", name).lower()
 
-    # egg-info 的 PKG-INFO 就是 PEP 566 METADATA，直接改名即可
-    shutil.copyfile(egg_info / "PKG-INFO", dist_info / "METADATA")
-    entries = egg_info / "entry_points.txt"
-    if entries.exists():
-        shutil.copyfile(entries, dist_info / "entry_points.txt")
-    # 这里的 plat_name 只是「打包机的平台」，进过 auditwheel 后会被改成
-    # musllinux_1_2_<arch>，两头一致才有意义，所以照旧写 sysconfig 的值。
-    (dist_info / "WHEEL").write_text(
-        "Wheel-Version: 1.0\n"
-        "Generator: onnxruntime-docker pack_wheel.py (apk repackage)\n"
-        "Root-Is-Purelib: false\n"
-        f"Tag: {tag}\n"
-    )
-    return dist_info
+
+def find_metadata_dir(site_packages: Path, package: str) -> Path:
+    """找 <package> 的元数据目录。
+
+    setuptools 打的包装成 ``<name>-<ver>.egg-info``（onnxruntime 就是），
+    meson-python / PEP 517 的包装成 ``<name>-<ver>.dist-info``（numpy 是）。
+    两者都要认，否则必然有一个包得靠 ``--package`` 特判。
+    """
+    patterns = {
+        f"{package}-*.dist-info",
+        f"{package}-*.egg-info",
+        f"{normalize_name(package)}-*.dist-info",
+        f"{normalize_name(package)}-*.egg-info",
+    }
+    found = sorted({p for pat in patterns for p in site_packages.glob(pat) if p.is_dir()})
+    if len(found) != 1:
+        raise SystemExit(
+            f"错误: 期望 {site_packages} 里恰好 1 个 {package} 的 dist-info/egg-info, "
+            f"实际 {found}（apk 没装对应的 py3-{package}？）"
+        )
+    return found[0]
+
+
+def metadata_file(meta_dir: Path) -> Path:
+    """egg-info 的叫 PKG-INFO，dist-info 的叫 METADATA，内容都是 PEP 566。"""
+    for name in ("METADATA", "PKG-INFO"):
+        path = meta_dir / name
+        if path.exists():
+            return path
+    raise SystemExit(f"错误: {meta_dir} 里既没有 METADATA 也没有 PKG-INFO")
 
 
 def metadata_version(pkg_info: Path) -> str:
@@ -263,34 +288,80 @@ def metadata_version(pkg_info: Path) -> str:
     raise SystemExit(f"错误: {pkg_info} 里没有 Version:")
 
 
-def from_apk(site_packages: Path, out_dir: Path, expect_version: str) -> int:
-    """重打包路径：site-packages 里的 onnxruntime -> 自包含 wheel。"""
-    pkg = site_packages / "onnxruntime"
-    if not pkg.is_dir():
-        return die(f"{pkg} 不存在（apk 没装 py3-onnxruntime？）")
-    egg_infos = sorted(site_packages.glob("onnxruntime-*.egg-info"))
-    if len(egg_infos) != 1:
-        return die(f"期望 {site_packages} 里恰好 1 个 onnxruntime egg-info, 实际 {egg_infos}")
+def write_dist_info(unroot: Path, meta_dir: Path, version: str, package: str) -> Path:
+    """把 apk 里的 dist-info/egg-info 变成 wheel 要的 dist-info 目录。"""
+    major, minor = sys.version_info[:2]
+    plat_name = sysconfig.get_platform().replace("-", "_").replace(".", "_")
+    tag = f"cp{major}{minor}-cp{major}{minor}-{plat_name}"
+    dist_info = unroot / f"{normalize_name(package)}-{version}.dist-info"
 
-    version = metadata_version(egg_infos[0] / "PKG-INFO")
+    if meta_dir.name.endswith(".dist-info"):
+        # 现代 dist-info 里除了 METADATA 还有 licenses/（PEP 639，METADATA 的
+        # License-File: 指向它）、entry_points.txt 等。整体复制，只剔掉三个由
+        # wheel 自己重写/本机相关的文件，否则 METADATA 里的 License-File 会指向
+        # 一个不存在的路径。
+        shutil.copytree(
+            meta_dir,
+            dist_info,
+            ignore=shutil.ignore_patterns(
+                "RECORD", "WHEEL", "INSTALLER", "REQUESTED", "direct_url.json"
+            ),
+        )
+    else:
+        dist_info.mkdir(parents=True, exist_ok=True)
+        # egg-info 的 PKG-INFO 就是 PEP 566 METADATA，直接改名即可
+        shutil.copyfile(meta_dir / "PKG-INFO", dist_info / "METADATA")
+        entries = meta_dir / "entry_points.txt"
+        if entries.exists():
+            shutil.copyfile(entries, dist_info / "entry_points.txt")
+
+    # 这里的 plat_name 只是「打包机的平台」，进过 auditwheel 后会被改成
+    # musllinux_1_2_<arch>，两头一致才有意义，所以照旧写 sysconfig 的值。
+    (dist_info / "WHEEL").write_text(
+        "Wheel-Version: 1.0\n"
+        "Generator: onnxruntime-docker pack_wheel.py (apk repackage)\n"
+        "Root-Is-Purelib: false\n"
+        f"Tag: {tag}\n"
+    )
+    return dist_info
+
+
+def from_apk(site_packages: Path, out_dir: Path, package: str, expect_version: str) -> int:
+    """重打包路径：site-packages 里的 <package> -> 自包含 wheel。"""
+    pkg = site_packages / package
+    if not pkg.is_dir():
+        return die(f"{pkg} 不存在（apk 没装 py3-{package}？）")
+
+    meta_dir = find_metadata_dir(site_packages, package)
+    version = metadata_version(metadata_file(meta_dir))
     if expect_version and version != expect_version:
         return die(
-            f"apk 里的 onnxruntime 是 {version}，但期望 {expect_version}"
-            f"（ONNX_VERSION 与 ALPINE_VERSION 不匹配？）"
+            f"apk 里的 {package} 是 {version}，但期望 {expect_version}"
+            f"（版本参数与 ALPINE_VERSION 不匹配？）"
         )
 
-    plat_name = sysconfig.get_platform().replace("-", "_").replace(".", "_")
     work = Path(tempfile.mkdtemp(prefix="ortapk-"))
     try:
         unroot = work / "tree"
         unroot.mkdir()
-        print(f"从 {pkg} 复制 onnxruntime {version}")
-        copy_package(pkg, unroot / "onnxruntime")
+        print(f"从 {pkg} 复制 {package} {version}")
+        copy_package(pkg, unroot / package)
 
-        capi = unroot / "onnxruntime" / "capi"
-        prepare_capi(capi, [])
-        write_dist_info(unroot, egg_infos[0], version, plat_name)
-        pack_tree(unroot, out_dir)
+        # 少数包会把要 bundle 的私有库放在 site-packages 的 <pkg>.libs/ 下
+        # （auditwheel 自己产出的目录结构），apk 版一般没有，有就一起带走。
+        libs = site_packages / f"{package}.libs"
+        if libs.is_dir():
+            print(f"复制 {libs.name}/")
+            copy_package(libs, unroot / libs.name)
+
+        # onnxruntime 特有：apk 把库装在 /usr/lib，capi 里全是软链，要解引用并按
+        # SONAME 改名。numpy 这类包的 .so 是包内真文件，不动它 —— 进了 auditwheel
+        # 自然会把 libopenblas / libgfortran 收进 numpy.libs/ 并改好 RPATH。
+        if package == "onnxruntime":
+            prepare_capi(unroot / package / "capi", [])
+
+        write_dist_info(unroot, meta_dir, version, package)
+        pack_tree(unroot, out_dir, package)
         return 0
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -303,6 +374,11 @@ def main() -> int:
         "--from-apk",
         metavar="SITE_PACKAGES",
         help="apk 装好的 site-packages 目录（重打包路径），如 /usr/lib/python3.14/site-packages",
+    )
+    ap.add_argument(
+        "--package",
+        default="onnxruntime",
+        help="要重打包的包名（--from-apk 用），如 onnxruntime / numpy",
     )
     ap.add_argument("--out-dir", required=True, help="最终 wheel 输出目录")
     ap.add_argument(
@@ -322,7 +398,7 @@ def main() -> int:
 
     out_dir = Path(args.out_dir).resolve()
     if args.from_apk:
-        return from_apk(Path(args.from_apk).resolve(), out_dir, args.expect_version)
+        return from_apk(Path(args.from_apk).resolve(), out_dir, args.package, args.expect_version)
 
     extra_dirs = [Path(args.lib_dir).resolve()] if args.lib_dir else []
     return from_source_wheel(Path(args.wheel_dir).resolve(), out_dir, extra_dirs)
