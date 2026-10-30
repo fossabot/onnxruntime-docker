@@ -129,11 +129,17 @@ docker buildx build --platform linux/arm64 --target runtime \
 ## 依赖处理
 
 **numpy 为什么也在这里。** onnxruntime 声明 `Requires-Dist: numpy>=1.21.6`，而 PyPI 上
-`armv7l` / `riscv64` / `ppc64le` 没有 numpy 的 musllinux 轮子，装的时候会退回源码编译，
-runtime 镜像里没有编译器。三个平台的 numpy 因此用同一套手法从 Alpine 包重打包。
+`armv7l` / `riscv64` / `ppc64le` / `loongarch64` 没有 numpy 的 musllinux 轮子，装的时候会退回
+源码编译，runtime 镜像里没有编译器。
 
-`--no-index` 只给 numpy 那一行：`x86_64` / `aarch64` 上 PyPI 有 numpy 轮子，不加就会被 uv
-静默改走 PyPI，另外三个架构的路径等于没验过。
+六个架构都自建 numpy（`--from-apk --package numpy`），不是只补缺的那四个。`x86_64` /
+`aarch64` 上 PyPI 有 numpy 2.4.6 的 musllinux 轮子，自建是为了让六个架构用同一份产物、
+消费者只需一条安装命令。因此 numpy 那一行必须带 `--no-index`，否则 uv 会在这两个架构上
+静默改走 PyPI，自建的那份反而没被验证。
+
+两边的构建有差异：自建版来自 Alpine 的 `py3-numpy`，openblas 是 `DYNAMIC_ARCH=0`（无运行期
+CPU 派发）；PyPI 官方轮子用 `scipy-openblas` 且 `DYNAMIC_ARCH=1`。OCR 与数据处理类负载不
+吃 BLAS，未做取舍；需要 BLAS 峰值性能时换用 PyPI 的 numpy。
 
 **依赖收集交给 auditwheel。** 打包前 wheel 里只有三个 `.so`（pybind 扩展、
 `libonnxruntime.so.1`、`libonnxruntime_providers_shared.so`），其余由 `auditwheel repair`
