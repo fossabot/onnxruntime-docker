@@ -1,0 +1,104 @@
+# syntax=docker/dockerfile:1.7
+#
+# onnxruntime -> self-contained wheel，**不编译**：直接复用 Alpine 官方 apk
+#
+# 与 Dockerfile（源码编译）产出**完全同名同结构**的 wheel，供 CI 在
+# ppc64le / riscv64 这类 QEMU 下一编就是数小时的架构上走快速通道。
+#
+# 原理：Alpine 官方 community/onnxruntime（1.24.4，arch="all !s390x !x86"）已经把
+# onnxruntime 编好并打成 py3-onnxruntime。装进镜像后：
+#   * python 包在 /usr/lib/python3.14/site-packages/onnxruntime/
+#   * capi/ 里 3 个 .so 全是指向 /usr/lib 的符号链接，真实主库在
+#     /usr/lib/libonnxruntime.so.1.24.4
+# 本文件只做「解引用复制 + 按 SONAME 对齐 + 补 dist-info + 打 zip」，然后交给
+# auditwheel repair 收集依赖（改名为 onnxruntime.libs/ 下的 xxx-<hash>.so）、
+# 改 RPATH、并把标签重打成 musllinux_1_2_<arch>。逻辑全在 pack_wheel.py 的
+# --from-apk 分支，与源码路径共用同一份代码。
+#
+# 注意 auditwheel **必须**在这个装了依赖的镜像里跑：它靠遍历 musl 搜索路径定位
+# 每个 DT_NEEDED，而 abseil / re2 / protobuf / icu 是 py3-onnxruntime 的运行时
+# 依赖，正好由 apk 装好（在只装 python3 的干净镜像里跑会直接
+# "Cannot repair wheel, because required library ... could not be located"）。
+#
+# 用法：
+#   docker buildx build --platform linux/arm64 \
+#       --build-arg APK_MIRROR=https://mirrors.tuna.tsinghua.edu.cn \
+#       --target wheel --output type=local,dest=./dist -f Dockerfile.repackage .
+#
+# 产物：./dist/wheels/onnxruntime-<ver>-cp314-cp314-musllinux_1_2_<arch>.whl + SHA256SUMS
+# （目录结构与 Dockerfile 一致，CI 与 tests/smoke.py 都不用改）
+
+ARG ALPINE_VERSION=3.24
+
+FROM alpine:${ALPINE_VERSION} AS repack
+
+ARG ONNX_VERSION=1.24.4
+ARG APK_MIRROR=""
+ARG PIP_MIRROR=""
+ARG AUDITWHEEL_VERSION=6.8.2
+ARG TARGETARCH
+
+LABEL maintainer="a76yyyy <q981331502@163.com>"
+LABEL org.opencontainers.image.source=https://github.com/qd-today/onnxruntime-docker
+
+# 镜像源（国内构建用）：把 APK_MIRROR 末尾的 / 去掉后整体替换 host
+RUN if [ -n "${APK_MIRROR}" ]; then \
+        sed -i "s|https://dl-cdn.alpinelinux.org|${APK_MIRROR%/}|g" /etc/apk/repositories; \
+    fi \
+ && cat /etc/apk/repositories
+
+# 没有官方 apk 的架构先 fail-fast，别让 apk 报一句 "unsatisfiable constraints" 就完事：
+#   386 / s390x —— 官方配方 arch="all !s390x !x86" 排除了它们。注意 Alpine 的 `x86`
+#                  指 32 位的 i386，不是 amd64；amd64 是有包的（py3-onnxruntime-1.24.4-r1）
+#   loong64 —— Alpine 官方没有这个仓库。实际上 buildx 在 FROM alpine:3.24 这步就会
+#              因 "no match for platform in manifest" 失败，这条分支是给「换了
+#              loong64 基座」的变体留的兜底，报错原因写得更直白
+RUN case "${TARGETARCH}" in \
+        386|s390x) \
+            echo "错误: onnxruntime 上游不支持 ${TARGETARCH}（Alpine 官方配方 arch=\"all !s390x !x86\"）" >&2; \
+            exit 1 ;; \
+        loong64) \
+            echo "错误: Alpine 官方没有 loong64 仓库，无 apk 可复用；只能走 Dockerfile 源码编译并换 loong64 基座" >&2; \
+            exit 1 ;; \
+    esac
+
+# py3-onnxruntime 提供包本体，同时把 abseil-cpp / re2 / libprotobuf-lite / icu-libs
+# 这些运行时依赖一并装好 —— auditwheel 要在本镜像里找得到它们才修得了 wheel；
+# py3-pip 用来装 auditwheel；py3-wheel 提供 `python3 -m wheel pack`；
+# binutils 提供 readelf；patchelf 由 auditwheel 自己调用
+RUN apk add --no-cache \
+        binutils \
+        patchelf \
+        py3-onnxruntime \
+        py3-pip \
+        py3-wheel \
+        python3
+
+RUN set -eux; \
+    if [ -n "${PIP_MIRROR}" ]; then \
+        pip_args="-i ${PIP_MIRROR}"; \
+    else \
+        pip_args=""; \
+    fi; \
+    python3 -m pip install --no-cache-dir --break-system-packages \
+        ${pip_args} "auditwheel==${AUDITWHEEL_VERSION}"; \
+    python3 -m auditwheel --version
+
+COPY pack_wheel.py /usr/local/bin/pack_wheel.py
+
+RUN set -eux; \
+    python3 /usr/local/bin/pack_wheel.py \
+        --from-apk /usr/lib/python3.14/site-packages \
+        --out-dir /wheels \
+        --expect-version "${ONNX_VERSION}"; \
+    cd /wheels; \
+    ls -l; \
+    sha256sum ./*.whl > SHA256SUMS; \
+    cat SHA256SUMS
+
+########################################################################
+# 产物出口（与 Dockerfile 的 wheel 阶段一致，CI 用 --output type=local 取出）
+########################################################################
+FROM scratch AS wheel
+
+COPY --from=repack /wheels/ /wheels/

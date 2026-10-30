@@ -1,12 +1,11 @@
-# Maintainer: leso-kn <info@lesosoftware.com>
+maintainer="leso-kn <info@lesosoftware.com>"
 pkgname=onnxruntime
-pkgver=1.19.2
-pkgrel=4
+pkgver=1.24.4
+pkgrel=1
 pkgdesc="Cross-platform, high performance ML inferencing and training accelerator"
-url="https://onnxruntime.ai"
-# x86, s390x, loongarch64: fails to build
-# riscv64: tests fails
-arch="all !x86 !s390x !riscv64 !loongarch64"
+url="https://onnxruntime.ai/"
+# s390x, x86: build fails
+arch="all !s390x !x86"
 license="MIT"
 makedepends="
 	abseil-cpp-dev
@@ -17,7 +16,6 @@ makedepends="
 	linux-headers
 	nlohmann-json
 	protobuf-dev
-	py3-numpy
 	py3-numpy-dev
 	py3-protobuf
 	py3-pybind11-dev
@@ -28,23 +26,52 @@ makedepends="
 	samurai
 	zlib-dev
 	"
-subpackages="
-	$pkgname-dev
-	py3-$pkgname-pyc
-	py3-$pkgname:py3
-	"
+subpackages="$pkgname-dev"
 source="$pkgname-$pkgver.tar.gz::https://github.com/microsoft/onnxruntime/archive/refs/tags/v$pkgver.tar.gz
 	flatbuffers-locale.patch.noauto
 	no-execinfo.patch
 	system.patch
 	0001-Remove-MATH_NO_EXCEPT-macro.patch
+	upb-fix.patch
+	gcc-15.patch
+	26187_disable-hascpudevice-test.patch.noauto
 	"
 options="net"
+
+case "$CARCH" in
+armhf) ;; # blocked by py3-flattbuffers
+*)
+	subpackages="
+		$subpackages
+		py3-$pkgname-pyc
+		py3-$pkgname:py3
+		"
+	;;
+esac
 
 # tests fail on arm 32 bit, see https://github.com/microsoft/onnxruntime/issues/16387
 case "$CARCH" in
 armhf|armv7) options="!check $options"; _extra_cxxflags="-Wno-overflow";;
 esac
+
+# still affects aarch64: https://github.com/microsoft/onnxruntime/pull/19382#issuecomment-3346660511
+case "$CARCH" in
+aarch64) _extra_cmake_flags="-Donnxruntime_USE_NEURAL_SPEED=OFF";;
+esac
+
+# MatMulNBits.Float32_4b_Accuracy* tests fail on loongarch64 due to not meeting precision threshold
+case "$CARCH" in
+loongarch64) options="!check";;
+esac
+
+prepare() {
+	default_prepare
+
+	# https://github.com/microsoft/onnxruntime/issues/26187
+	case "$CARCH" in
+	aarch64|loongarch64|ppc64le|riscv64) patch -p1 < "$srcdir"/26187_disable-hascpudevice-test.patch.noauto;;
+	esac
+}
 
 build() {
 	CFLAGS="$CFLAGS -O2 -flto=auto" \
@@ -53,13 +80,12 @@ build() {
 	cmake -S cmake -B build -G Ninja \
 		-DCMAKE_BUILD_TYPE=None \
 		-DCMAKE_INSTALL_PREFIX=/usr \
+		-DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
 		-DBUILD_ONNX_PYTHON=ON \
 		-Donnxruntime_BUILD_SHARED_LIB=ON \
 		-Donnxruntime_BUILD_UNIT_TESTS="$(want_check && echo ON || echo OFF)" \
 		-Donnxruntime_ENABLE_PYTHON=ON \
-		-Donnxruntime_USE_NEURAL_SPEED=OFF # fix for 1.17.0, see: https://github.com/microsoft/onnxruntime/pull/19382
-	# hack for protobuf 23
-	sed -i 's|CMAKE_CXX_STANDARD 11|CMAKE_CXX_STANDARD 17|' build/_deps/onnx-src/CMakeLists.txt
+		$_extra_cmake_flags
 
 	# from testing/flutter/shared-libcxx.patch.engine
 	patch -p1 < ../flatbuffers-locale.patch.noauto
@@ -72,7 +98,7 @@ build() {
 }
 
 check() {
-	ctest --test-dir build --output-on-failure
+	ctest --test-dir build
 }
 
 package() {
@@ -81,8 +107,8 @@ package() {
 	cd build
 	python3 ../setup.py install --skip-build --root="$pkgdir"
 
-	ln -sfv ../../../../libonnxruntime_providers_shared.so \
-		"$(echo "$pkgdir"/usr/lib/python3*/site-packages/onnxruntime/capi/libonnxruntime_providers_shared.so)"
+	cd "$pkgdir"/usr/lib/python3*/site-packages/onnxruntime/capi
+	ln -sfv ../../../../libonnxruntime_providers_shared.so ../../../../libonnxruntime.so.* .
 }
 
 py3() {
@@ -99,9 +125,12 @@ py3() {
 }
 
 sha512sums="
-3bf25e431d175c61953d28b1bf8f6871376684263992451a5b2a66e670768fc66e7027f141c6e3f4d1eddeebeda51f31ea0adf4749e50d99ee89d0a26bec77ce  onnxruntime-1.19.2.tar.gz
+53b3aed02e085c83aa3c7e1faffeae7f70675d6770bc44d148085ded47940f29471eef76e0c4565bbb471f0f814610e0d1892ce9305c63d011fe851a22b1f7ab  onnxruntime-1.24.4.tar.gz
 52e1c1e4a69543b3b9bcfabbd3f6202edf309f56be129668ad226e7ad7c2f1220ce169f9957fbc1fc4f3cae5abc984f8fe5ea4990fb2ebb033d7111d1d298f95  flatbuffers-locale.patch.noauto
 976913be90b0a82ff1ba403f46306ef4e5939bb05296227c99d3c4a609dd00f5750f9b1c6c30d20791ff0724c1bcffc6aa498eac906257aefefc6f35df796fe0  no-execinfo.patch
-963542ac3cfef08c9dcd60f28c0a47d6a9fbfcbe43efbf891047939aecd5b56fe0285f538e0da3df409a53745433b0ed2bc2470c59ae8fcf86ce94bf7cd02649  system.patch
-b70a09b0de7921e494a85fe7f0ac46ad9c1117e9dcf8f7ec45e518df975bb56e1b663396ae969deaaabda94135c5b6e082f59d8b916483518589ffde14c04565  0001-Remove-MATH_NO_EXCEPT-macro.patch
+28a20ad841356d6145740f691c100ae24fd8a00af118e39e26fe30bb639ea9f05697842df92907fb7578666f04d37bfdba44efbdd9ff686ede9d3eb0e9ff6ceb  system.patch
+8f6129686fc3f241df174b8a86e957642e0b0a3a9e2ef15bea98ddea199291b444b6b39e4f56f8a7a2e64ee03113ad140fd664a7b6f33a8a9e23c40e883e08df  0001-Remove-MATH_NO_EXCEPT-macro.patch
+0a69996c407bc999bf3c5f1ca0594e2666890dddcce480213ca7c317613b0b1ad3382fb117bda492fbd2cd450dad1bb3a1d747b3565c16ae17dc0bbd3dc38577  upb-fix.patch
+7484dce0ba435f72a4186d43586cad1ab5867328a6cd190359b71af72d0c788d52fcf730ed59efd05e5383fe9b3f91bb7f17e5507738ba6d297e3868008eaeb6  gcc-15.patch
+4b7a7878256846947c0689ad56d34b92ba0fed400b5bc29ce4ae8154a2be227fb7c0cf627f9d922da057234a0d962dcf35aac0676356c662efc4279228c6ba6e  26187_disable-hascpudevice-test.patch.noauto
 "

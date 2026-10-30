@@ -1,64 +1,66 @@
-name: Publish Package
+name: Build Image
+
+# 薄调用方：真正的流水线在 _image.yml（plan → build → smoke → publish）。
+# 这里只做两件事：决定什么时候跑、把 dispatch 的输入原样传下去。
+#
+# 只在两种情况下构建：
+#   * workflow_dispatch —— 手动触发，默认只构建+冒烟、不发布
+#   * tag 推送          —— 正式发布
+# 普通 push 到 main 不构建：onnxruntime 单平台编译十几分钟，QEMU 架构数小时，
+# 每次 merge 都跑既费额度也没有额外信息（改动是否可用，dispatch 一次就能验）。
 on:
-  workflow_dispatch: {}
   push:
-    paths-ignore:
-      - ".github/workflows/DockerHub-Description.md"
-      - "**.md"
-    tags: ["*"]
-    branches: [main]
-
+    tags:
+      - '*'
+  workflow_dispatch:
+    inputs:
+      push:
+        description: '构建并通过冒烟测试后发布到 Docker Hub（不勾选则只构建+冒烟，不发布任何镜像）'
+        type: boolean
+        default: false
+      platforms:
+        description: '要构建的平台，逗号分隔不要空格，如 linux/amd64,linux/arm64；留空=默认 linux/amd64,linux/arm64,linux/arm/v7。子集构建禁止发布'
+        type: string
+        default: ''
+      apk_mirror:
+        description: 'apk 镜像源，如 https://mirrors.tuna.tsinghua.edu.cn（留空=官方源）'
+        type: string
+        default: ''
+      alpine_version:
+        description: 'alpine 版本；决定 Python 小版本，进而决定 wheel 的 cpXX tag'
+        type: string
+        default: '3.24'
+      onnx_version:
+        description: 'onnxruntime 版本（同时是发布出去的镜像 tag）'
+        type: string
+        default: '1.24.4'
+      native_arm:
+        description: '用 GitHub 原生 arm64 runner 构建 arm64（比 QEMU 快一个数量级）；runner 不可用时取消勾选回退 QEMU'
+        type: boolean
+        default: true
+      cache_bust:
+        description: '缓存 scope 后缀。留空=复用缓存；填任意值=强制不复用旧层（基准测试用）'
+        type: string
+        default: ''
+      builder:
+        description: '构建方式。repackage=复用 Alpine 官方 apk 重打包（每架构几十秒）；source=源码编译（arm64 约 18 分钟，QEMU 架构数小时）'
+        type: choice
+        options:
+          - repackage
+          - source
+        default: repackage
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        platform:
-          - linux/arm64
-          - linux/amd64
-          - linux/arm/v6
-          - linux/arm/v7
-          # - linux/ppc64le
-    name: Publish Package job for ${{ matrix.platform }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      - id: login-ghcr
-        name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-        continue-on-error: true
-      - id: login-dockerhub
-        name: Login to DockerHub
-        uses: docker/login-action@v3
-        with:
-          registry: docker.io
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-        continue-on-error: true
-      - id: meta
-        name: Docker meta
-        uses: docker/metadata-action@v5
-        with:
-          images: |
-            name=ghcr.io/${{ github.repository_owner }}/onnxruntime,enable=${{ steps.login-ghcr.outcome == 'success' }}
-            name=docker.io/a76yyyy/onnxruntime,enable=${{ steps.login-dockerhub.outcome == 'success' }}
-          tags: |
-            type=edge,branch=main
-            type=ref,event=tag
-      - name: Publish Package
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: ${{ matrix.platform }}
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+  image:
+    uses: ./.github/workflows/_image.yml
+    secrets: inherit
+    with:
+      # tag 推送时 github.event.inputs 全是 null，各输入退回 workflow_call 里的默认值
+      push: ${{ github.event.inputs.push == 'true' }}
+      platforms: ${{ github.event.inputs.platforms || '' }}
+      apk_mirror: ${{ github.event.inputs.apk_mirror || '' }}
+      alpine_version: ${{ github.event.inputs.alpine_version || '3.24' }}
+      onnx_version: ${{ github.event.inputs.onnx_version || '1.24.4' }}
+      native_arm: ${{ github.event.inputs.native_arm != 'false' }}
+      cache_bust: ${{ github.event.inputs.cache_bust || '' }}
+      # tag 推送时 builder 为空 → 默认走 repackage（快）；显式选 source 才用编译路径
+      dockerfile: ${{ github.event.inputs.builder == 'source' && 'Dockerfile' || 'Dockerfile.repackage' }}
