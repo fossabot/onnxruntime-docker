@@ -41,8 +41,12 @@ RUN apk add --no-cache python3 uv && \
         --find-links /wheels onnxruntime==1.24.4
 ```
 
-装出来的包完全一致，差别只在体积：COPY 会把 `/wheels` 留在最终镜像里，本架构多约 55MB；
-后面加 `rm -rf /wheels` 无效——COPY 与 RUN 是两层，删掉的字节仍留在下层，镜像大小照样算。
+两种写法装出的包完全一致，只差体积（arm64）：
+
+| 写法 | 镜像 | `/wheels` 留在镜像里 |
+|---|---|---|
+| `RUN --mount=type=bind,from=<wheelhouse>` | 279 MB | 否 |
+| `COPY --from=<wheelhouse> /wheels` | 334 MB | 是（`rm` 无效：COPY 与 RUN 是两层） |
 
 多个 wheelhouse 可一次挂载（`--mount` 与 `--find-links` 都可重复，`from=` 直接写镜像名）：
 
@@ -69,6 +73,7 @@ FROM a76yyyy/onnxruntime:1.24.4
 | numpy | 2.4.6（`musllinux_1_2` wheel） | 同左 |
 | 随 wheel 自带的依赖 | `onnxruntime.libs/`、`numpy.libs/`：protobuf、abseil、re2、ICU、openblas、libgfortran、libstdc++、libgcc_s | 已展开到 site-packages |
 | 内容位置 | `/wheels` | `/usr/lib/python3.14/site-packages` |
+| 包管理器 | — | `uv`（python3 不自带 pip；装包时用得上） |
 
 wheel 自包含，装进干净的 alpine 即可 import 并推理，不需要 apk 提供上述库。
 
@@ -116,8 +121,12 @@ numpy-<ver>-cpXXX-cpXXX-musllinux_1_2_<arch>.whl
 SHA256SUMS
 ```
 
-标签由 `auditwheel repair` 生成。`musllinux_1_2` 表示「在 musl ≥ 1.2 上构建、除 musl 外不依赖
-系统库」；裸 `linux_<arch>` 只说明 CPU 架构，不保证 libc 版本或依赖齐全，PyPI 也不接受这种标签。
+标签由 `auditwheel repair` 生成。
+
+| 标签 | 含义 | PyPI 接受 |
+|---|---|---|
+| `musllinux_1_2_<arch>` | 在 musl ≥ 1.2 上构建，除 musl 外不依赖系统库 | 是 |
+| `linux_<arch>` | 只说明 CPU 架构，不保证 libc 版本或依赖齐全 | 否 |
 
 ## 构建
 
@@ -145,33 +154,45 @@ docker buildx build --platform linux/arm64 --target runtime \
 
 ## 依赖处理
 
-**numpy 为什么也在这里。** onnxruntime 声明 `Requires-Dist: numpy>=1.21.6`，而 PyPI 上
-`armv7l` / `riscv64` / `ppc64le` / `loongarch64` 没有 numpy 的 musllinux 轮子，装的时候会退回
-源码编译，runtime 镜像里没有编译器。
+### numpy 的来源与差异
 
-六个架构都自建 numpy（`--from-apk --package numpy`），不是只补缺的那四个。`x86_64` /
-`aarch64` 上 PyPI 有 numpy 2.4.6 的 musllinux 轮子，自建是为了让六个架构用同一份产物、
-消费者只需一条安装命令。因此 numpy 那一行必须带 `--no-index`，否则 uv 会在这两个架构上
-静默改走 PyPI，自建的那份反而没被验证。
+- onnxruntime 声明 `Requires-Dist: numpy>=1.21.6`
+- PyPI 的 numpy musllinux 轮子只覆盖 `x86_64` / `aarch64`；`armv7l` / `riscv64` / `ppc64le` /
+  `loongarch64` 缺失，源装需要编译器，runtime 镜像没有
+- 六个架构都自建（`--from-apk --package numpy`），保证同一份产物、消费者只写一条安装命令
 
-两边的构建有差异：自建版来自 Alpine 的 `py3-numpy`，openblas 是 `DYNAMIC_ARCH=0`（无运行期
-CPU 派发）；PyPI 官方轮子用 `scipy-openblas` 且 `DYNAMIC_ARCH=1`。OCR 与数据处理类负载不
-吃 BLAS，未做取舍；需要 BLAS 峰值性能时换用 PyPI 的 numpy。
+`--no-index` 只给 numpy 那一行：不加的话 uv 会在 `x86_64` / `aarch64` 上静默改走 PyPI，
+自建的那份不被验证。
 
-**依赖收集交给 auditwheel。** 打包前 wheel 里只有三个 `.so`（pybind 扩展、
-`libonnxruntime.so.1`、`libonnxruntime_providers_shared.so`），其余由 `auditwheel repair`
-扫 `DT_NEEDED` 补进 `<pkg>.libs/` 并改写 RPATH。两个例外：
+自建版与 PyPI 官方轮子的差异：
+
+| | 自建（Alpine 的 `py3-numpy`） | PyPI 官方 |
+|---|---|---|
+| OpenBLAS | Alpine 系统包 | `scipy-openblas64` |
+| `DYNAMIC_ARCH` | 0（编译期锁定 armv8 基线） | 1（运行期按 CPU 派发） |
+| BLAS 整数宽度 | 32 位 | 64 位 |
+| 覆盖架构 | 六个 | `x86_64` / `aarch64` |
+
+OCR 与数据处理不走 BLAS，因此未按架构拆分；需要 BLAS 峰值性能的消费者改用 PyPI 的 numpy。
+
+### 依赖收集交给 auditwheel
+
+打包前 wheel 里只有三个 `.so`（pybind 扩展、`libonnxruntime.so.1`、
+`libonnxruntime_providers_shared.so`），其余由 `auditwheel repair` 扫 `DT_NEEDED` 补进
+`<pkg>.libs/` 并改写 RPATH。以下两项它看不到：
 
 | 项 | 处理 |
 |---|---|
 | `libonnxruntime_providers_shared.so` | 不是 `DT_NEEDED`，是 `Env::GetRuntimePath()` 拼路径 `dlopen` 的，必须自己放进 `capi/` |
 | `capi/libonnxruntime.so.1` | 不在 pybind 的 `DT_NEEDED` 里（apk 版的 pybind 自带静态 ORT），留给 C/C++ API 与 `dlopen` |
 
-`auditwheel repair` 必须在装了这些依赖的镜像里跑，否则报
-`Cannot repair wheel, because required library "libabsl_..." could not be located`。
-不传 `--plat`：它从 ELF interpreter 认出 `libc=musl`，自己给出 `musllinux_1_2_<arch>`。
+运行前提：
 
-**两个省体积的做法。**
+- 必须在装了这些依赖的镜像里跑，干净镜像会报
+  `Cannot repair wheel, because required library "libabsl_..." could not be located`
+- 不传 `--plat`：从 ELF interpreter 认出 `libc=musl`，自动给出 `musllinux_1_2_<arch>`
+
+### 两个省体积的做法
 
 | 做法 | 原因 |
 |---|---|

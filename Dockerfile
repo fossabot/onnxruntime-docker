@@ -189,7 +189,8 @@ RUN --mount=type=bind,from=repack,source=/wheels,target=/wheels \
         --find-links /wheels "onnxruntime==${ONNX_VERSION}"; \
     python3 -c "import onnxruntime, numpy; \
 print('onnxruntime', onnxruntime.__version__, onnxruntime.get_available_providers()); \
-print('numpy', numpy.__version__)"
+print('numpy', numpy.__version__)"; \
+    rm -rf /tmp/uv-* /root/.cache/uv
 
 # runtime 是给上层 FROM 的基座，`docker run <image>` 打一次版本自检
 CMD ["python3", "-c", "import onnxruntime, numpy; print('onnxruntime', onnxruntime.__version__, '| numpy', numpy.__version__)"]
