@@ -14,7 +14,21 @@
 
 ## 快速开始
 
-取 wheel 自己组装：
+取 wheel 自己组装。推荐 bind mount——`/wheels` 只在那一条 `RUN` 里存在，不进镜像层：
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM alpine:3.24
+RUN apk add --no-cache python3 uv
+RUN --mount=type=bind,from=a76yyyy/onnxruntime:1.24.4-wheelhouse,source=/wheels,target=/wheels \
+    uv pip install --system --break-system-packages --no-cache \
+        --no-index --find-links /wheels numpy==2.4.6 && \
+    uv pip install --system --break-system-packages --no-cache \
+        --find-links /wheels onnxruntime==1.24.4
+```
+
+需要 BuildKit（首行 `# syntax=docker/dockerfile:1`，Docker 23 起默认启用）。构建器不支持
+`RUN --mount`（如 Kaniko）或运行时还要用 `/wheels` 时，改用 COPY：
 
 ```dockerfile
 FROM a76yyyy/onnxruntime:1.24.4-wheelhouse AS onnx
@@ -27,7 +41,10 @@ RUN apk add --no-cache python3 uv && \
         --find-links /wheels onnxruntime==1.24.4
 ```
 
-多个 wheelhouse 可一次挂载（`--mount` 与 `--find-links` 都可重复）：
+装出来的包完全一致，差别只在体积：COPY 会把 `/wheels` 留在最终镜像里，本架构多约 55MB；
+后面加 `rm -rf /wheels` 无效——COPY 与 RUN 是两层，删掉的字节仍留在下层，镜像大小照样算。
+
+多个 wheelhouse 可一次挂载（`--mount` 与 `--find-links` 都可重复，`from=` 直接写镜像名）：
 
 ```dockerfile
 RUN --mount=type=bind,from=a76yyyy/onnxruntime:1.24.4-wheelhouse,source=/wheels,target=/w/a \
