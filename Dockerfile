@@ -1,37 +1,60 @@
 # syntax=docker/dockerfile:1.7
 #
-# onnxruntime -> self-contained Python wheel
+# onnxruntime + numpy -> self-contained wheel，**不编译**：直接复用 Alpine 官方 apk
 #
-# 本文件从源码编译 onnxruntime 并产出 wheel（不含 numpy，numpy 走 Dockerfile.repackage）。
-# 编译开关、patch 列表与顺序全部照抄 alpine/APKBUILD（1.24.4），改动只有：
-#   * 关掉单元测试（onnxruntime_BUILD_UNIT_TESTS=OFF）
-#   * 用 `setup.py bdist_wheel` 代替 `setup.py install`
-#   * 把 libonnxruntime.so.* / libonnxruntime_providers_shared.so 塞进 capi，
-#     再用 `auditwheel repair` 递归收集它们依赖的非系统库（abseil / protobuf /
-#     re2 / icu）到 onnxruntime.libs/、把 RPATH 改成
-#     $ORIGIN:$ORIGIN/../../onnxruntime.libs，并把标签重打成 musllinux_1_2_<arch>，
-#     使其在任意 alpine 镜像里 `pip install` 后可直接 import
-#   * 跳过两个对 1.24.4 已失效/有害的 patch（见下方说明）
+# 与 Dockerfile（源码编译）产出**完全同名同结构**的 onnxruntime wheel，供 CI 在
+# ppc64le / riscv64 这类 QEMU 下一编就是数小时的架构上走快速通道。
+#
+# 原理：Alpine 官方 community/onnxruntime（1.24.4，arch="all !s390x !x86"）已经把
+# onnxruntime 编好并打成 py3-onnxruntime。装进镜像后：
+#   * python 包在 /usr/lib/python3.14/site-packages/onnxruntime/
+#   * capi/ 里 3 个 .so 全是指向 /usr/lib 的符号链接，真实主库在
+#     /usr/lib/libonnxruntime.so.1.24.4
+# 本文件只做「解引用复制 + 按 SONAME 对齐 + 补 dist-info + 打 zip」，然后交给
+# auditwheel repair 收集依赖（改名为 onnxruntime.libs/ 下的 xxx-<hash>.so）、
+# 改 RPATH、并把标签重打成 musllinux_1_2_<arch>。逻辑全在 pack_wheel.py 的
+# --from-apk 分支，与源码路径共用同一份代码。
+#
+# 为什么连 numpy 一起重打包：onnxruntime 依赖 numpy，而 numpy 在 armv7 / riscv64 /
+# ppc64le 上 PyPI **没有** musllinux 轮子，uv 会退回源码编译 —— 运行时镜像里没有
+# 编译器。把 Alpine 的 py3-numpy（同样只依赖 musl + libopenblas）重打包进
+# wheelhouse 后，`uv pip install --find-links /wheels` 在这些架构上也有二进制轮子。
+# numpy 走的是同一条 --from-apk 路径，只是 --package numpy，且不需要 capi 那套
+# 软链处理；auditwheel 会把 /usr/lib/libopenblas.so.3（及它依赖的 libgfortran）
+# 收进 numpy.libs/，所以 BLAS 在干净镜像里也能用。
+#
+# 注意 auditwheel **必须**在这个装了依赖的镜像里跑：它靠遍历 musl 搜索路径定位
+# 每个 DT_NEEDED，而 abseil / re2 / protobuf / icu 是 py3-onnxruntime 的运行时
+# 依赖、libopenblas 是 py3-numpy 的，正好由 apk 装好（在只装 python3 的干净镜像
+# 里跑会直接 "Cannot repair wheel, because required library ... could not be located"）。
 #
 # 用法：
 #   docker buildx build --platform linux/arm64 \
 #       --build-arg APK_MIRROR=https://mirrors.tuna.tsinghua.edu.cn \
-#       --output type=local,dest=./dist .
+#       --target wheel --output type=local,dest=./dist -f Dockerfile.repackage .
 #
-# 产物：./dist/wheels/onnxruntime-<ver>-<py>-<py>-musllinux_1_2_<arch>.whl
+# 产物：./dist/wheels/onnxruntime-<ver>-cp314-cp314-musllinux_1_2_<arch>.whl
+#       ./dist/wheels/numpy-<ver>-cp314-cp314-musllinux_1_2_<arch>.whl
+#       ./dist/wheels/SHA256SUMS（覆盖以上两个）
+# （onnxruntime wheel 的目录结构与命名与 Dockerfile 一致，CI 与 tests/smoke.py 都不用改）
+#
+# 另一个出口是可直接运行的 runtime 镜像（见文件末尾），它只从 wheelhouse 装包，
+# 不再 `apk add py3-numpy`。
 
 ARG ALPINE_VERSION=3.24
 
-########################################################################
-# 1) 依赖 + 源码 + patch
-########################################################################
-FROM alpine:${ALPINE_VERSION} AS src
+# loong64 没有官方 alpine 镜像，得走 ghcr.io/loong64/alpine（那个仓库里有
+# py3-onnxruntime 与 py3-numpy，版本与官方仓一致），所以基座做成参数。
+ARG BASE_IMAGE=alpine:${ALPINE_VERSION}
+
+FROM ${BASE_IMAGE} AS repack
 
 ARG ONNX_VERSION=1.24.4
+ARG NUMPY_VERSION=2.4.6
 ARG APK_MIRROR=""
-ARG GIT_DOMAIN=https://github.com
 ARG PIP_MIRROR=""
 ARG AUDITWHEEL_VERSION=6.8.2
+ARG TARGETARCH
 
 LABEL maintainer="a76yyyy <q981331502@163.com>"
 LABEL org.opencontainers.image.source=https://github.com/qd-today/onnxruntime-docker
@@ -42,37 +65,39 @@ RUN if [ -n "${APK_MIRROR}" ]; then \
     fi \
  && cat /etc/apk/repositories
 
-# makedepends 来自 alpine/APKBUILD；patchelf 给 auditwheel 用；
-# py3-pip 用来装 auditwheel（wheel 阶段的依赖收集 + RPATH 全交给它）
-RUN apk add --no-cache \
-        abseil-cpp-dev \
-        bash \
-        binutils \
-        build-base \
-        cmake \
-        curl \
-        gtest-dev \
-        icu-dev \
-        linux-headers \
-        nlohmann-json \
-        patch \
-        patchelf \
-        protobuf-dev \
-        py3-numpy-dev \
-        py3-packaging \
-        py3-pip \
-        py3-protobuf \
-        py3-pybind11-dev \
-        py3-setuptools \
-        py3-wheel \
-        python3 \
-        python3-dev \
-        re2-dev \
-        samurai \
-        zlib-dev
+# 没有官方 apk 的架构先 fail-fast，别让 apk 报一句 "unsatisfiable constraints" 就完事：
+#   386 / s390x —— 官方配方 arch="all !s390x !x86" 排除了它们。注意 Alpine 的 `x86`
+#                  指 32 位的 i386，不是 amd64；amd64 是有包的
+#   armv6      —— 官方配方 armhf 分支只出 base 包，Python 绑定被 py3-flatbuffers 挡住
+#   loong64    —— 官方没有这个架构，但 ghcr.io/loong64/alpine 有同版本的
+#                  py3-onnxruntime / py3-numpy，把 BASE_IMAGE 指过去即可
+# 注意：TARGETARCH 对 armv6 和 armv7 都是 `arm`，必须连 TARGETVARIANT 一起看，
+# 否则 armv7 会被误拦。
+RUN case "${TARGETARCH}/${TARGETVARIANT}" in \
+        386/|s390x/|arm/v6) \
+            echo "错误: 该架构无 apk py3-onnxruntime（386/s390x 是 Alpine 配方 arch=\"all !s390x !x86\" 排除；armv6 的 Python 绑定被 py3-flatbuffers 挡住）" >&2; \
+            exit 1 ;; \
+    esac && \
+    if ! apk search -x py3-onnxruntime >/dev/null 2>&1; then \
+        echo "错误: 当前基座（${BASE_IMAGE}）没有 py3-onnxruntime；loong64 请传 --build-arg BASE_IMAGE=ghcr.io/loong64/alpine:${ALPINE_VERSION}" >&2; \
+        exit 1; \
+    fi
 
-ARG PIP_MIRROR=""
-ARG AUDITWHEEL_VERSION=6.8.2
+# py3-onnxruntime 提供包本体，同时把 abseil-cpp / re2 / libprotobuf-lite / icu-libs
+# 这些运行时依赖一并装好 —— auditwheel 要在本镜像里找得到它们才修得了 wheel；
+# py3-numpy 同理：它把 libopenblas / libgfortran 带进来，auditwheel 才能把
+# libopenblas.so.3 收进 numpy.libs/（这也是这里装 numpy 而不是 pip 装的原因：
+# pip 装出来的 wheel 已经 bundle 过一遍，再 repair 会嵌套）；
+# py3-pip 用来装 auditwheel；py3-wheel 提供 `python3 -m wheel pack`；
+# binutils 提供 readelf；patchelf 由 auditwheel 自己调用
+RUN apk add --no-cache \
+        binutils \
+        patchelf \
+        py3-numpy \
+        py3-onnxruntime \
+        py3-pip \
+        py3-wheel \
+        python3
 
 RUN set -eux; \
     if [ -n "${PIP_MIRROR}" ]; then \
@@ -84,118 +109,87 @@ RUN set -eux; \
         ${pip_args} "auditwheel==${AUDITWHEEL_VERSION}"; \
     python3 -m auditwheel --version
 
-WORKDIR /ort
-
-# patch 配方直接复用 alpine/ 目录，不做任何修改
-COPY alpine/ /ort/patches/
-
-RUN set -eux; \
-    mkdir -p /ort/src; \
-    curl -fsSL --retry 5 --retry-delay 5 \
-        "${GIT_DOMAIN%/}/microsoft/onnxruntime/archive/refs/tags/v${ONNX_VERSION}.tar.gz" \
-      | tar -xz --strip-components=1 -C /ort/src; \
-    test -f /ort/src/setup.py; \
-    cat /ort/src/VERSION_NUMBER
-
-# 按 APKBUILD 的 source= 顺序应用 patch（default_prepare 的等价操作）。
-# flatbuffers-locale.patch 和 26187_*.patch 带 .noauto 后缀，由 prepare()/build()
-# 单独处理，这里不打。
-#
-# 与 APKBUILD 的差异（两处，都是因为配方里的 patch 面向更早的 onnxruntime）：
-#
-# 1. 不用 system.patch。它面向 1.22 及更早版本（那时 absl / protobuf / re2 都是
-#    无条件 FetchContent 拉源码），对 1.24.4 的
-#    cmake/external/onnxruntime_external_deps.cmake 有 3/4 个 hunk 打不上。
-#    1.24.4 上游已经改成 `onnxruntime_fetchcontent_declare(... FIND_PACKAGE_ARGS ...)`
-#    「先 find_package，找不到才下载」，装了 abseil-cpp-dev / protobuf-dev /
-#    re2-dev / nlohmann-json / gtest-dev 之后效果与 system.patch 一致（用系统库）。
-#
-# 2. 跳过 upb-fix.patch。它预先生成 protobuf::libupb / protoc-gen-upb* 这几个
-#    IMPORTED 目标，本意是给「源码编译 protobuf」那条路补洞；但只要系统里能找到
-#    protobuf，protobuf-config.cmake 自己就会定义这些目标，于是报
-#    "Some (but not all) targets in this export set were already defined"。
-RUN set -eux; \
-    cd /ort/src; \
-    for p in \
-        no-execinfo.patch \
-        0001-Remove-MATH_NO_EXCEPT-macro.patch \
-        gcc-15.patch \
-    ; do \
-        echo ">>> applying ${p}"; \
-        patch -p1 --forward --batch < "/ort/patches/${p}"; \
-    done
-
-########################################################################
-# 2) cmake 配置
-########################################################################
-FROM src AS configured
-
-ARG TARGETARCH
-
-# APKBUILD: aarch64 需要关掉 Neural-Speed EP；armv7 需要 -Wno-overflow
-RUN set -eux; \
-    extra_cmake=""; \
-    extra_cxx=""; \
-    case "${TARGETARCH}" in \
-        arm64)    extra_cmake="-Donnxruntime_USE_NEURAL_SPEED=OFF" ;; \
-        arm|armv7) extra_cxx="-Wno-overflow" ;; \
-    esac; \
-    CFLAGS="-O2 -flto=auto" \
-    CXXFLAGS="-O2 ${extra_cxx} -Wno-deprecated-declarations -Wno-error=template-id-cdtor -flto=auto -U_FORTIFY_SOURCE" \
-    LDFLAGS="-Wl,--copy-dt-needed-entries" \
-    cmake -S /ort/src/cmake -B /ort/src/build -G Ninja \
-        -DCMAKE_BUILD_TYPE=None \
-        -DCMAKE_INSTALL_PREFIX=/usr \
-        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
-        -DBUILD_ONNX_PYTHON=ON \
-        -Donnxruntime_BUILD_SHARED_LIB=ON \
-        -Donnxruntime_BUILD_UNIT_TESTS=OFF \
-        -Donnxruntime_ENABLE_PYTHON=ON \
-        ${extra_cmake}
-
-# APKBUILD 在 cmake 配置之后、编译之前打这个 patch（它 patch 的是
-# build/_deps/flatbuffers-src 里的源码，所以必须在 FetchContent 之后）
-RUN cd /ort/src && patch -p1 --forward --batch < /ort/patches/flatbuffers-locale.patch.noauto
-
-########################################################################
-# 3) 编译 + 打 wheel
-########################################################################
-FROM configured AS builder
-
-RUN set -eux; \
-    cmake --build /ort/src/build --parallel "$(nproc)"
-
-# 注：APKBUILD 在 aarch64/loongarch64/ppc64le/riscv64 上还会打
-# 26187_disable-hascpudevice-test.patch.noauto，它只是把 DeviceDiscoveryTest
-# 里的一个 gtest 用例改名成 DISABLED_*。我们这个构建
-# onnxruntime_BUILD_UNIT_TESTS=OFF，根本不编译该文件，因此这个 patch 跳过。
-# 同理 0001-Remove-MATH_NO_EXCEPT-macro.patch / gcc-15.patch 也只是修测试代码，
-# 这里仍然照配方打（无副作用），保持与 upstream 一致。
-
 COPY pack_wheel.py /usr/local/bin/pack_wheel.py
 
-# setup.py 的 package_data 只会在 build/ 目录里挑 libonnxruntime.so* 等文件，
-# 所以先确认 cmake 的 POST_BUILD 已经把库拷到了 build/onnxruntime/capi/。
-# bdist_wheel 完成后由 pack_wheel.py 做「自包含化 + 重新打包」。
+# 两个包都走同一条 --from-apk 路径，产物落在同一个 /wheels：
+#   numpy         —— 包内 .so 是真文件，原样交给 auditwheel
+#   onnxruntime   —— capi 里是软链，多两步解引用 + 按 SONAME 命名
 RUN set -eux; \
-    cd /ort/src/build; \
-    ls -l onnxruntime/capi/*.so*; \
-    python3 ../setup.py bdist_wheel --dist-dir /ort/wheel-raw; \
-    ls -l /ort/wheel-raw
-
-RUN set -eux; \
+    site=/usr/lib/python3.14/site-packages; \
     python3 /usr/local/bin/pack_wheel.py \
-        --wheel-dir /ort/wheel-raw \
+        --from-apk "${site}" \
+        --package numpy \
         --out-dir /wheels \
-        --lib-dir /ort/src/build/onnxruntime/capi; \
+        --expect-version "${NUMPY_VERSION}"; \
+    python3 /usr/local/bin/pack_wheel.py \
+        --from-apk "${site}" \
+        --package onnxruntime \
+        --out-dir /wheels \
+        --expect-version "${ONNX_VERSION}"; \
     cd /wheels; \
     ls -l; \
     sha256sum ./*.whl > SHA256SUMS; \
     cat SHA256SUMS
 
 ########################################################################
-# 4) 产物出口（CI 用 --output type=local 取出）
+# 产物出口（与 Dockerfile 的 wheel 阶段一致，CI 用 --output type=local 取出）
 ########################################################################
 FROM scratch AS wheel
 
-COPY --from=builder /wheels/ /wheels/
+COPY --from=repack /wheels/ /wheels/
+
+########################################################################
+# 运行时出口：自带 numpy / onnxruntime 的可运行镜像，不依赖 apk 的 py3-numpy
+#
+# 为什么不用 `COPY --from=repack /wheels /wheels` + `RUN rm -rf /wheels`：
+# COPY 和 RUN 是两层，删掉的字节仍然留在下层里，`docker images` 照样算进去
+# （本架构两个 wheel 合计约 25MB 白花）。这里用 BuildKit 的 bind mount 把
+# wheelhouse 只挂进这一条 RUN，装完即随 layer 一起消失，镜像里根本没有 /wheels。
+#
+# 需要给上层 `COPY --from` 复用 wheel 的，用 `--target wheel` 出的那个镜像
+# （CI 里发成 `a76yyyy/onnxruntime:<ver>-wheelhouse`），它本来就只有 /wheels。
+########################################################################
+# 与 repack 同一个基座：loong64 没有官方 alpine，运行层也得跟着换
+FROM ${BASE_IMAGE} AS runtime
+
+ARG ONNX_VERSION=1.24.4
+ARG NUMPY_VERSION=2.4.6
+ARG APK_MIRROR=""
+
+LABEL maintainer="a76yyyy <q981331502@163.com>"
+LABEL org.opencontainers.image.source=https://github.com/qd-today/onnxruntime-docker
+
+RUN if [ -n "${APK_MIRROR}" ]; then \
+        sed -i "s|https://dl-cdn.alpinelinux.org|${APK_MIRROR%/}|g" /etc/apk/repositories; \
+    fi \
+ && cat /etc/apk/repositories
+
+# python3 必须 apk 装：解释器与 musl 的 libc 基线由它提供（两个 wheel 各自把
+# libstdc++ / libgcc_s / openblas 之类收在自己的 .libs 下，与 python3 无关）。
+# **不能**再装 py3-numpy —— numpy 只从 wheelhouse 来，这正是本文件要证明的事。
+RUN apk add --no-cache python3 uv
+
+# numpy 单独一步装、且 --no-index：保证它一定来自 wheelhouse。
+# 不加 --no-index 的话，aarch64 / amd64 上 uv 会优先拿 PyPI 的 musllinux 轮子，
+# armv7 / riscv64 / ppc64le 上才会用到本地那个 —— 那等于只有三个架构被验证到。
+#
+# `--no-cache` 不是省事，是必须：uv 默认把解压后的包再存一份到 /root/.cache/uv，
+# 会原样进镜像层（实测多出 130MB，比两个包本身还大）。
+RUN --mount=type=bind,from=repack,source=/wheels,target=/wheels \
+    set -eux; \
+    uv pip install --system --break-system-packages --no-cache \
+        --no-index --find-links /wheels "numpy==${NUMPY_VERSION}"; \
+    python3 -c "import numpy; print('numpy', numpy.__version__, numpy.__file__)"
+
+# 其余依赖（flatbuffers / packaging / protobuf / sympy）是纯 Python 轮子，各架构
+# 都有，仍走 PyPI；numpy 已经装好且满足 >=1.21.6，这一步不会被动到。
+RUN --mount=type=bind,from=repack,source=/wheels,target=/wheels \
+    set -eux; \
+    uv pip install --system --break-system-packages --no-cache \
+        --find-links /wheels "onnxruntime==${ONNX_VERSION}"; \
+    python3 -c "import onnxruntime, numpy; \
+print('onnxruntime', onnxruntime.__version__, onnxruntime.get_available_providers()); \
+print('numpy', numpy.__version__)"
+
+# runtime 是给上层 FROM 的基座，`docker run <image>` 打一次版本自检
+CMD ["python3", "-c", "import onnxruntime, numpy; print('onnxruntime', onnxruntime.__version__, '| numpy', numpy.__version__)"]

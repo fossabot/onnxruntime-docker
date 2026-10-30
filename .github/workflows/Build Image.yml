@@ -64,7 +64,6 @@ jobs:
       numpy_version: ${{ github.event.inputs.numpy_version || '2.4.6' }}
       native_arm: ${{ github.event.inputs.native_arm != 'false' }}
       cache_bust: ${{ github.event.inputs.cache_bust || '' }}
-      # 固定走重打包路径：源码编译那条（Dockerfile）没有 runtime 出口，
-      # 拿不到可运行镜像也没法按新方式冒烟，CI 里不再提供。
-      # 需要源码编译时手动 `--target wheel`，见 README。
-      dockerfile: Dockerfile.repackage
+      # 仓库只有一个 Dockerfile（重打包路径，两个出口）。源码编译路径已归档到
+      # archive/source-build 分支，CI 不再构建它。
+      dockerfile: Dockerfile

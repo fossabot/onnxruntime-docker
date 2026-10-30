@@ -3,7 +3,7 @@
 
 * ``--wheel-dir``（源码路径，Dockerfile 用）：吃 setup.py ``bdist_wheel`` 的产物，
   补齐 capi 里的库、解软链，再交给 auditwheel 修复后重新打包。
-* ``--from-apk``（重打包路径，Dockerfile.repackage 用）：直接吃 Alpine 官方包
+* ``--from-apk``（重打包路径，Dockerfile 用）：直接吃 Alpine 官方包
   装进 site-packages 的目录树（``--package`` 指定包名，默认 onnxruntime），
   组装成 wheel 树后修复打包。目前已用于 onnxruntime 与 numpy。
 

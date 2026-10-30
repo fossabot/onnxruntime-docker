@@ -23,7 +23,7 @@
    cmake 的架构探测被 uname 骗了（在原生 arm64 runner 上跑 armv7 容器，uname
    仍报 aarch64），编译能过、产出的却是宿主架构的 .so。
 
-numpy 从 `Dockerfile.repackage` 的 wheelhouse 来时是「apk 重打包 + auditwheel 把
+numpy 从 wheelhouse 来时是「apk 重打包 + auditwheel 把
 libopenblas 收进 numpy.libs/」，所以额外做一次**线性代数**：`numpy.linalg.solve`
 是 LAPACK 调用，只有 libopenblas / libgfortran 真被 RPATH 找到并加载才可能算对；
 光 `import numpy` 只能证明 `.so` 被 mmap 了，证明不了 BLAS 可用。
