@@ -19,7 +19,7 @@
 1. import + 版本 + provider —— wheel 能不能被加载、CPU EP 有没有被编进去；
 2. 真实推理 —— 只 import 不推理的话，`libonnxruntime.so.1` 用 dlopen 懒加载，
    很多自包含化问题（RPATH、DT_NEEDED 缺失）要到建 Session 时才炸；
-3. ELF e_machine —— 产物是不是目标架构的机器码。QEMU 下构建时最容易踩的坑是
+3. ELF e_machine —— 产物是不是目标架构的机器码。QEMU 下构建时常见的问题是
    cmake 的架构探测被 uname 骗了（在原生 arm64 runner 上跑 armv7 容器，uname
    仍报 aarch64），编译能过、产出的却是宿主架构的 .so。
 

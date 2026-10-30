@@ -2,7 +2,7 @@
 #
 # onnxruntime -> self-contained Python wheel
 #
-# 本文件把原来的「abuild 打 apk 包」流程改造成「直接产出 wheel」。
+# 本文件从源码编译 onnxruntime 并产出 wheel（不含 numpy，numpy 走 Dockerfile.repackage）。
 # 编译开关、patch 列表与顺序全部照抄 alpine/APKBUILD（1.24.4），改动只有：
 #   * 关掉单元测试（onnxruntime_BUILD_UNIT_TESTS=OFF）
 #   * 用 `setup.py bdist_wheel` 代替 `setup.py install`
@@ -101,10 +101,10 @@ RUN set -eux; \
 # flatbuffers-locale.patch 和 26187_*.patch 带 .noauto 后缀，由 prepare()/build()
 # 单独处理，这里不打。
 #
-# 与 APKBUILD 的差异（两处，都是因为配方里的 patch 不是针对 1.24.4 的）：
+# 与 APKBUILD 的差异（两处，都是因为配方里的 patch 面向更早的 onnxruntime）：
 #
-# 1. 跳过 system.patch。它针对 1.22 及更早的 onnxruntime 写的（当时 absl /
-#    protobuf / re2 都是无条件 FetchContent 拉源码），对 1.24.4 的
+# 1. 不用 system.patch。它面向 1.22 及更早版本（那时 absl / protobuf / re2 都是
+#    无条件 FetchContent 拉源码），对 1.24.4 的
 #    cmake/external/onnxruntime_external_deps.cmake 有 3/4 个 hunk 打不上。
 #    1.24.4 上游已经改成 `onnxruntime_fetchcontent_declare(... FIND_PACKAGE_ARGS ...)`
 #    「先 find_package，找不到才下载」，装了 abseil-cpp-dev / protobuf-dev /

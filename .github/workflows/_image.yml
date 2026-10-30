@@ -465,8 +465,7 @@ jobs:
       - name: Guard - digest completeness
         env:
           EXPECTED: ${{ needs.plan.outputs.expected }}
-        # artifact 会跨 job 传递，缺一个平台就会静默合并出残缺 index（历史上踩过），
-        # 所以合并前先按平台数核对一遍
+        # artifact 跨 job 传递，缺一个平台会静默合并出残缺 index，所以合并前按平台数核对
         run: |
           set -euo pipefail
           want=$(printf '%s' "$EXPECTED" | tr ',' '\n' | grep -c . )
