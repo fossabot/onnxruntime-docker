@@ -71,9 +71,11 @@ RUN if [ -n "${APK_MIRROR}" ]; then \
 #   armv6      —— 官方配方 armhf 分支只出 base 包，Python 绑定被 py3-flatbuffers 挡住
 #   loong64    —— 官方没有这个架构，但 ghcr.io/loong64/alpine 有同版本的
 #                  py3-onnxruntime / py3-numpy，把 BASE_IMAGE 指过去即可
-RUN case "${TARGETARCH}" in \
-        386|s390x|arm) \
-            echo "错误: 该架构无 apk py3-onnxruntime（Alpine 官方配方 arch=\"all !s390x !x86\"，armhf 无 Python 绑定），不能走重打包路径" >&2; \
+# 注意：TARGETARCH 对 armv6 和 armv7 都是 `arm`，必须连 TARGETVARIANT 一起看，
+# 否则会把 armv7 一起拦掉（首次 CI 就是这么挂的）。
+RUN case "${TARGETARCH}/${TARGETVARIANT}" in \
+        386/|s390x/|arm/v6) \
+            echo "错误: 该架构无 apk py3-onnxruntime（386/s390x 是 Alpine 配方 arch=\"all !s390x !x86\" 排除；armv6 的 Python 绑定被 py3-flatbuffers 挡住）" >&2; \
             exit 1 ;; \
     esac && \
     if ! apk search -x py3-onnxruntime >/dev/null 2>&1; then \
