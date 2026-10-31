@@ -20,8 +20,8 @@ FROM a76yyyy/onnxruntime:1.24.4
 ```dockerfile
 # syntax=docker/dockerfile:1
 FROM alpine:3.24
-RUN apk add --no-cache python3 uv
 RUN --mount=type=bind,from=a76yyyy/onnxruntime:1.24.4-wheelhouse,source=/wheels,target=/w \
+    apk add --no-cache $(cat /w/system-packages.txt) uv && \
     uv export --frozen --no-hashes -o /tmp/req.txt && \
     uv pip install --system --break-system-packages --no-cache \
         --index-url https://pypi.org/simple \
@@ -92,10 +92,14 @@ loong64 构建需 `--build-arg BASE_IMAGE=ghcr.io/loong64/alpine:3.24`（该仓�
 onnxruntime-<ver>-cpXXX-cpXXX-musllinux_1_2_<arch>.whl
 numpy-<ver>-cpXXX-cpXXX-musllinux_1_2_<arch>.whl
 SHA256SUMS
+system-packages.txt
 simple/
   index.html
   <project>/index.html
 ```
+
+`system-packages.txt` 是需要 `apk add` 的运行时包（wheel 已自带全部 C 库，这里只剩解释器与数据文件），
+构建期用它装 runtime 镜像，下游照单安装即可。
 
 `simple/` 由 `src/pack_wheel.py --emit-index` 生成，链接为相对路径（`../../<wheel>#sha256=`），可与 wheel 目录一起挂到任意位置。
 

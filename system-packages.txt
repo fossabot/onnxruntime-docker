@@ -1,0 +1,2 @@
+python3
+icu-data-en

@@ -111,6 +111,8 @@ RUN set -eux; \
     python3 -m auditwheel --version
 
 COPY src/pack_wheel.py /usr/local/bin/pack_wheel.py
+# apk 清单随 wheelhouse 发布，上层照单安装即可，不必各自维护
+COPY system-packages.txt /wheels/system-packages.txt
 
 # 两个包都走同一条 --from-apk 路径，产物落在同一个 /wheels：
 #   numpy         —— 包内 .so 是真文件，原样交给 auditwheel
@@ -169,8 +171,10 @@ RUN if [ -n "${APK_MIRROR}" ]; then \
 # python3 必须 apk 装：解释器与 musl 的 libc 基线由它提供（两个 wheel 各自把
 # libstdc++ / libgcc_s / openblas 之类收在自己的 .libs 下，与 python3 无关）。
 # **不能**再装 py3-numpy —— numpy 只从 wheelhouse 来，这正是本文件要证明的事。
-# icu-data-en 只 2.9MB：re2 的 Unicode 字符类需要 ICU 数据，不装则 \p{...} 类正则不可用
-RUN apk add --no-cache python3 uv icu-data-en
+# 直接按 wheelhouse 里的清单装：清单写错会在这里构建失败，不会等到上层才发现。
+# uv 是工具不是运行时依赖，单独列出。
+RUN --mount=type=bind,from=repack,source=/wheels,target=/w \
+    apk add --no-cache $(cat /w/system-packages.txt) uv
 
 # numpy 单独一步装、且 --no-index：保证它一定来自 wheelhouse。
 # 不加 --no-index 的话，aarch64 / amd64 上 uv 会优先拿 PyPI 的 musllinux 轮子，
