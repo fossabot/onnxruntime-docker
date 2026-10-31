@@ -67,6 +67,12 @@ RUN --mount=type=bind,from=a76yyyy/onnxruntime:1.24.4-wheelhouse,source=/wheels,
         -r requirements.txt
 ```
 
+索引多于两个时用环境变量一次给全（空格分隔，顺序同样是优先级）：
+
+```dockerfile
+ENV UV_EXTRA_INDEX_URL="file:///w/a/simple file:///w/b/simple"
+```
+
 直接基于 runtime 镜像：
 
 ```dockerfile
