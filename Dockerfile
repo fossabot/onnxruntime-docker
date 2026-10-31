@@ -177,37 +177,25 @@ RUN if [ -n "${APK_MIRROR}" ]; then \
 RUN --mount=type=bind,from=repack,source=/wheels,target=/w \
     apk add --no-cache $(cat /w/system-packages.txt) uv
 
-# numpy 单独一步装、且 --no-index：保证它一定来自 wheelhouse。
-# 不加 --no-index 的话，aarch64 / amd64 上 uv 会优先拿 PyPI 的 musllinux 轮子，
-# armv7 / riscv64 / ppc64le 上才会用到本地那个 —— 那等于只有三个架构被验证到。
+# 装包：本地 wheelhouse 的索引优先，PyPI 兜底纯 Python 依赖。
+#
+# 索引优先级（uv 官方口径 + 实测）：`--index-url` 指定的默认索引是最低优先级，
+# `--extra-index-url` 按定义顺序查询，first-index 策略下第一个含该包的索引胜出。
+# 实测（往本地 wheel 里塞标记文件后安装）：本地那份一定被选中，PyPI 只在本地没有该包时兜底。
+# 纯 Python 依赖（flatbuffers / packaging / protobuf / sympy）本地没有，走 PyPI。
 #
 # `--no-cache` 不是省事，是必须：uv 默认把解压后的包再存一份到 /root/.cache/uv，
 # 会原样进镜像层（实测多出 130MB，比两个包本身还大）。
 RUN --mount=type=bind,from=repack,source=/wheels,target=/wheels \
     set -eux; \
     uv pip install --system --break-system-packages --no-cache \
-        --no-index --find-links /wheels "numpy==${NUMPY_VERSION}"; \
-    python3 -c "import numpy; print('numpy', numpy.__version__, numpy.__file__)"
-
-# onnxruntime 本体同样只从 wheelhouse 取：--no-index 让 PyPI 完全不参与，wheelhouse
-# 缺件就是构建失败，而不是静默回落到 PyPI 的同名包（PyPI 的 onnxruntime 没有 cp314 的
-# musllinux 轮子，真回落会在源码编译这一步失败，错误信息还指向别处）。
-RUN --mount=type=bind,from=repack,source=/wheels,target=/wheels \
-    set -eux; \
-    uv pip install --system --break-system-packages --no-cache --no-deps \
-        --no-index --find-links /wheels "onnxruntime==${ONNX_VERSION}"; \
+        --index-url "${PIP_MIRROR:-https://pypi.org/simple}" \
+        --extra-index-url file:///wheels/simple \
+        "numpy==${NUMPY_VERSION}" "onnxruntime==${ONNX_VERSION}"; \
+    uv pip check --system; \
     python3 -c "import onnxruntime, numpy; \
 print('onnxruntime', onnxruntime.__version__, onnxruntime.get_available_providers()); \
 print('numpy', numpy.__version__)"; \
-    rm -rf /tmp/uv-* /root/.cache/uv
-
-# 传递依赖（flatbuffers / packaging / protobuf / sympy）是纯 Python 轮子，各架构都有，
-# 走 PyPI。清单写死是有意的：上游若新增依赖而这里没跟上，下面的 pip check 会让构建失败。
-RUN set -eux; \
-    uv pip install --system --break-system-packages --no-cache \
-        --index-url "${PIP_MIRROR:-https://pypi.org/simple}" \
-        flatbuffers packaging protobuf sympy; \
-    uv pip check --system; \
     rm -rf /tmp/uv-* /root/.cache/uv
 
 # runtime 是给上层 FROM 的基座，`docker run <image>` 打一次版本自检

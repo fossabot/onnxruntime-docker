@@ -16,31 +16,24 @@ onnxruntime 与 numpy 的 musllinux wheel 分发，另附装好的可运行镜�
 ```dockerfile
 # syntax=docker/dockerfile:1.7
 FROM alpine:3.24
-RUN --mount=type=bind,from=a76yyyy/onnxruntime:1.24.4-wheelhouse,source=/wheels,target=/w1 \
-    --mount=type=bind,from=a76yyyy/onnxruntime:1.24.4-wheelhouse,source=/wheels,target=/w2 \
+RUN --mount=type=bind,from=a76yyyy/onnxruntime:wheelhouse,source=/wheels,target=/w1 \
+    --mount=type=bind,from=a76yyyy/onnxruntime:wheelhouse,source=/wheels,target=/w2 \
     apk add --no-cache $(cat /w1/system-packages.txt) uv && \
-    uv pip install --system --break-system-packages --no-cache --no-deps \
-        --no-index --find-links /w1 --find-links /w2 \
-        "numpy==2.4.6" "onnxruntime==1.24.4" && \
     uv pip install --system --break-system-packages --no-cache \
-        --index-url https://pypi.org/simple flatbuffers packaging protobuf sympy && \
-    uv pip check --system
+        --index-url https://pypi.org/simple \
+        --extra-index-url file:///w1/simple \
+        --extra-index-url file:///w2/simple \
+        "numpy==2.4.6" "onnxruntime==1.24.4"
 ```
 
 | 写法 | 原因 |
 |---|---|
 | `apk add $(cat /w1/system-packages.txt)` | 清单是 wheelhouse 的运行时前置条件（解释器与 `libz`），写错会在这里构建失败 |
-| `--no-index --find-links` | wheelhouse 提供的包**只**从本地取。`--no-index` 让 PyPI 完全不参与，缺件就是构建失败，而不是静默回落到 PyPI 的同名包（PyPI 的 onnxruntime 没有 cp314 的 musllinux 轮子，真回落会在源码编译那步失败，报错还指向别处） |
-| `--no-deps` | 只装 wheel 本体，传递依赖显式列在下一步，不让解析器自己去找 |
-| 第二步走 PyPI | 纯 Python 依赖各架构都有轮子，从 PyPI 取即可 |
-| `uv pip check` | 上游新增依赖而这一步的清单没跟上时，构建直接失败 |
+| `--index-url https://pypi.org/simple` | 默认索引是**最低**优先级，纯 Python 依赖（flatbuffers / packaging / protobuf / sympy）从这里兜底 |
+| `--extra-index-url file:///wN/simple` | 每个 wheelhouse 一个，按定义顺序查询；first-index 策略下第一个含该包的索引胜出。实测（往本地 wheel 里塞标记文件后安装）：本地那份一定被选中 |
+| 发行名与 PyPI 同名 | wheelhouse 里的 wheel 用 PyPI 同名发行名（如 `opencv-python-headless`），用户换回 PyPI 版不用改任何配置；功能差异只在本仓库刻意裁剪的那部分 |
 
-每个 `--find-links` 给一份 wheelhouse 即可：每个包只属于一个 wheelhouse、版本也钉死，
-不存在歧义。若同一个包出现在多个 wheelhouse 且版本不同，flat 索引没有优先级，那时改用
-PEP 503 索引（`--extra-index-url file:///w1/simple`，按定义顺序查询，第一个含该包的胜出）。
-
-`/w1/simple` 是 PEP 503 索引，链接为相对路径，可与 wheel 目录一起挂到任意位置。
-| 标签 | 含义 | PyPI 接受 |
+`/w1/simple` 是 PEP 503 索引，链接为相对路径，可与 wheel 目录一起挂到任意位置。| 标签 | 含义 | PyPI 接受 |
 |---|---|---|
 | `musllinux_1_2_<arch>` | 在 musl ≥ 1.2 上构建，除 musl 外不依赖系统库 | 是 |
 | `linux_<arch>` | 只说明 CPU 架构 | 否 |
