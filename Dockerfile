@@ -168,7 +168,8 @@ RUN if [ -n "${APK_MIRROR}" ]; then \
 # python3 必须 apk 装：解释器与 musl 的 libc 基线由它提供（两个 wheel 各自把
 # libstdc++ / libgcc_s / openblas 之类收在自己的 .libs 下，与 python3 无关）。
 # **不能**再装 py3-numpy —— numpy 只从 wheelhouse 来，这正是本文件要证明的事。
-RUN apk add --no-cache python3 uv
+# icu-data-en 只 2.9MB：re2 的 Unicode 字符类需要 ICU 数据，不装则 \p{...} 类正则不可用
+RUN apk add --no-cache python3 uv icu-data-en
 
 # numpy 单独一步装、且 --no-index：保证它一定来自 wheelhouse。
 # 不加 --no-index 的话，aarch64 / amd64 上 uv 会优先拿 PyPI 的 musllinux 轮子，

@@ -50,6 +50,7 @@ ENV UV_EXTRA_INDEX_URL="file:///w/a/simple file:///w/b/simple"
 | onnxruntime | 1.24.4（`musllinux_1_2` wheel） | 同左 |
 | numpy | 2.4.6（`musllinux_1_2` wheel） | 同左 |
 | 包管理器 | — | `uv`（python3 不含 pip） |
+| ICU 数据 | — | `icu-data-en`（2.9 MB） |
 | 内容位置 | `/wheels` | `/usr/lib/python3.14/site-packages` |
 
 ## 支持的平台
@@ -79,7 +80,7 @@ loong64 构建需 `--build-arg BASE_IMAGE=ghcr.io/loong64/alpine:3.24`（该仓�
 | 镜像 | 首次拉取 | 占用磁盘 | 容器内 |
 |---|---|---|---|
 | `1.24.4-wheelhouse`（arm64） | 26.0 MiB | 54.8 MB | 26 MiB |
-| `1.24.4`（arm64） | 63.4 MiB | 282 MB | 178 MB（site-packages 128 MB） |
+| `1.24.4`（arm64） | 64.5 MiB | 287 MB | 181 MB（site-packages 128 MB） |
 | `1.24.4`（armv7） | — | 237 MB | 103 MB |
 
 `占用磁盘` 取 `docker images` 口径：containerd 计入解压层与压缩 blob 两份。
@@ -148,7 +149,15 @@ OCR 与数据处理不走 BLAS，未按架构拆分。
 | `libonnxruntime_providers_shared.so` | 非 `DT_NEEDED`，由 `Env::GetRuntimePath()` 拼路径 `dlopen`，须手动放进 `capi/` |
 | `capi/libonnxruntime.so.1` | 不在 pybind 的 `DT_NEEDED` 里，留给 C API 与 `dlopen` |
 
-`auditwheel repair` 必须在装了这些依赖的镜像里运行，干净镜像会报 `Cannot repair wheel, because required library "libabsl_..." could not be located`。不传 `--plat`，它从 ELF interpreter 认出 `libc=musl`。
+`auditwheel repair` 要从系统里解析每个 `DT_NEEDED`，因此构建镜像必须已装被解析的库；缺少时报
+`Cannot repair wheel, because required library "libabsl_..." could not be located`。
+
+| 打包目标 | 需已安装的 apk 包 | 由它带入 |
+|---|---|---|
+| onnxruntime | `py3-onnxruntime` | `abseil-cpp-*`、`re2`、`libprotobuf-lite`、`icu-libs` |
+| numpy | `py3-numpy` | `libopenblas`、`libgfortran` |
+
+不必装 `-dev` 包，运行时库即可。不传 `--plat`：auditwheel 从 ELF interpreter 认出 `libc=musl`。
 
 ### 体积
 
@@ -159,7 +168,7 @@ OCR 与数据处理不走 BLAS，未按架构拆分。
 
 ## 已知限制
 
-- 不含 ICU 数据文件（`libre2` 本地化正则），需要时 `apk add icu-data-en`。
+- 只含 `icu-data-en`（2.9 MB）。`libre2` 处理非英语 Unicode 字符类需 `apk add icu-data-full`（+31.6 MB）。
 - sympy + mpmath 是 runtime 镜像里最大的一块，onnxruntime 的硬依赖，去掉会破坏形状推断。
 - numpy 的 dist-info 有一条 `License-File` 指向 apk 未打包的目录，安装时 pip 告警但不失败。
 - wheel 的 zip 条目带 mtime，构建不可逐字节复现；内容一致，`sha256` 每次不同。
