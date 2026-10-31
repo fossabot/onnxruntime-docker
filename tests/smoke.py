@@ -226,6 +226,13 @@ def main(argv):
     print("python %s | %s | %s"
           % (platform.python_version(), platform.machine(), sys.platform))
 
+    print("== 无 wheel 残留 ==")
+    # wheelhouse 只在构建期 bind mount，runtime 镜像里不该出现；留下说明那层没被回收
+    leftovers = [p for p in ("/wheels", "/w") if os.path.exists(p)]
+    if leftovers:
+        raise SystemExit("runtime 镜像里残留 wheel 目录: %s" % ", ".join(leftovers))
+    print("  未发现 /wheels 或 /w")
+
     print("== numpy / 线性代数 ==")
     check_numpy()
 
