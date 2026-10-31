@@ -11,10 +11,25 @@ jobs:
     if: startsWith(github.repository, 'qd-today/onnxruntime-docker')
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
+
+    # Hub 的短描述上限 100 字节（中文每字 3 字节），超出会被静默截断
+    - name: Check short description length
+      env:
+        DESC: ${{ github.event.repository.description }}
+      run: |
+        bytes=$(printf '%s' "$DESC" | wc -c | tr -d ' ')
+        echo "短描述 $bytes 字节: $DESC"
+        if [ "$bytes" -gt 100 ]; then
+          echo "::error::短描述 $bytes 字节，超过 Docker Hub 的 100 字节上限"
+          exit 1
+        fi
+        if [ "$bytes" -eq 0 ]; then
+          echo "::warning::仓库描述为空，Docker Hub 短描述会是空的"
+        fi
 
     - name: Docker Hub Description
-      uses: peter-evans/dockerhub-description@v2
+      uses: peter-evans/dockerhub-description@v4
       with:
         username: ${{ secrets.DOCKER_USERNAME }}
         password: ${{ secrets.DOCKER_PASSWORD }}
