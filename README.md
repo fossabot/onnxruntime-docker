@@ -22,10 +22,11 @@ FROM a76yyyy/onnxruntime:1.24.4
 FROM alpine:3.24
 RUN apk add --no-cache python3 uv
 RUN --mount=type=bind,from=a76yyyy/onnxruntime:1.24.4-wheelhouse,source=/wheels,target=/w \
+    uv export --frozen --no-hashes -o /tmp/req.txt && \
     uv pip install --system --break-system-packages --no-cache \
         --index-url https://pypi.org/simple \
         --extra-index-url file:///w/simple \
-        -r requirements.txt
+        -r /tmp/req.txt
 ```
 
 多 wheelhouse：
