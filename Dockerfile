@@ -159,6 +159,7 @@ FROM ${BASE_IMAGE} AS runtime
 ARG ONNX_VERSION=1.24.4
 ARG NUMPY_VERSION=2.4.6
 ARG APK_MIRROR=""
+ARG PIP_MIRROR=""
 
 LABEL maintainer="a76yyyy <q981331502@163.com>"
 LABEL org.opencontainers.image.source=https://github.com/qd-today/onnxruntime-docker
@@ -188,15 +189,25 @@ RUN --mount=type=bind,from=repack,source=/wheels,target=/wheels \
         --no-index --find-links /wheels "numpy==${NUMPY_VERSION}"; \
     python3 -c "import numpy; print('numpy', numpy.__version__, numpy.__file__)"
 
-# 其余依赖（flatbuffers / packaging / protobuf / sympy）是纯 Python 轮子，各架构
-# 都有，仍走 PyPI；numpy 已经装好且满足 >=1.21.6，这一步不会被动到。
+# onnxruntime 本体同样只从 wheelhouse 取：--no-index 让 PyPI 完全不参与，wheelhouse
+# 缺件就是构建失败，而不是静默回落到 PyPI 的同名包（PyPI 的 onnxruntime 没有 cp314 的
+# musllinux 轮子，真回落会在源码编译这一步失败，错误信息还指向别处）。
 RUN --mount=type=bind,from=repack,source=/wheels,target=/wheels \
     set -eux; \
-    uv pip install --system --break-system-packages --no-cache \
-        --find-links /wheels "onnxruntime==${ONNX_VERSION}"; \
+    uv pip install --system --break-system-packages --no-cache --no-deps \
+        --no-index --find-links /wheels "onnxruntime==${ONNX_VERSION}"; \
     python3 -c "import onnxruntime, numpy; \
 print('onnxruntime', onnxruntime.__version__, onnxruntime.get_available_providers()); \
 print('numpy', numpy.__version__)"; \
+    rm -rf /tmp/uv-* /root/.cache/uv
+
+# 传递依赖（flatbuffers / packaging / protobuf / sympy）是纯 Python 轮子，各架构都有，
+# 走 PyPI。清单写死是有意的：上游若新增依赖而这里没跟上，下面的 pip check 会让构建失败。
+RUN set -eux; \
+    uv pip install --system --break-system-packages --no-cache \
+        --index-url "${PIP_MIRROR:-https://pypi.org/simple}" \
+        flatbuffers packaging protobuf sympy; \
+    uv pip check --system; \
     rm -rf /tmp/uv-* /root/.cache/uv
 
 # runtime 是给上层 FROM 的基座，`docker run <image>` 打一次版本自检

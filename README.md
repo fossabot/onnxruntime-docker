@@ -14,95 +14,32 @@ onnxruntime 与 numpy 的 musllinux wheel 分发，另附装好的可运行镜�
 ## 快速开始
 
 ```dockerfile
-FROM a76yyyy/onnxruntime:1.24.4
-```
-
-```dockerfile
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.7
 FROM alpine:3.24
-RUN --mount=type=bind,from=a76yyyy/onnxruntime:1.24.4-wheelhouse,source=/wheels,target=/w \
-    apk add --no-cache $(cat /w/system-packages.txt) uv && \
-    uv export --frozen --no-hashes -o /tmp/req.txt && \
+RUN --mount=type=bind,from=a76yyyy/onnxruntime:1.24.4-wheelhouse,source=/wheels,target=/w1 \
+    --mount=type=bind,from=a76yyyy/onnxruntime:1.24.4-wheelhouse,source=/wheels,target=/w2 \
+    apk add --no-cache $(cat /w1/system-packages.txt) uv && \
+    uv pip install --system --break-system-packages --no-cache --no-deps \
+        --no-index --find-links /w1 --find-links /w2 \
+        "numpy==2.4.6" "onnxruntime==1.24.4" && \
     uv pip install --system --break-system-packages --no-cache \
-        --index-url https://pypi.org/simple \
-        --extra-index-url file:///w/simple \
-        -r /tmp/req.txt
+        --index-url https://pypi.org/simple flatbuffers packaging protobuf sympy && \
+    uv pip check --system
 ```
 
-多 wheelhouse：
-
-```dockerfile
-ENV UV_EXTRA_INDEX_URL="file:///w/a/simple file:///w/b/simple"
-```
-
-| 写法 | 镜像（arm64） | `/wheels` 进镜像 |
-|---|---|---|
-| `RUN --mount=type=bind` | 279 MB | 否 |
-| `COPY --from=<wheelhouse> /wheels` | 334 MB | 是（`rm` 无效，两层） |
-
-`RUN --mount` 需要 BuildKit（首行 `# syntax=docker/dockerfile:1`）；Kaniko 等不支持时用 `COPY --from`。
-
-## 镜像内容
-
-| 组件 | wheelhouse | runtime |
-|---|---|---|
-| 基础镜像 | `scratch` | `alpine:3.24`；loong64 为 `ghcr.io/loong64/alpine:3.24` |
-| Python | — | 3.14 |
-| onnxruntime | 1.24.4（`musllinux_1_2` wheel） | 同左 |
-| numpy | 2.4.6（`musllinux_1_2` wheel） | 同左 |
-| 包管理器 | — | `uv`（python3 不含 pip） |
-| ICU 数据 | — | `icu-data-en`（2.9 MB） |
-| 内容位置 | `/wheels` | `/usr/lib/python3.14/site-packages` |
-
-## 支持的平台
-
-| 平台 | wheelhouse | runtime | 轮子架构名 |
-|---|---|---|---|
-| `linux/amd64` | ✓ | ✓ | `x86_64` |
-| `linux/arm64` | ✓ | ✓ | `aarch64` |
-| `linux/arm/v7` | ✓ | ✓ | `armv7l` |
-| `linux/ppc64le` | ✓ | ✓ | `ppc64le` |
-| `linux/riscv64` | ✓ | ✓ | `riscv64` |
-| `linux/loong64` | ✓ | ✓ | `loongarch64` |
-| `linux/386` | ✗ | ✗ | — |
-| `linux/arm/v6` | ✗ | ✗ | — |
-| `linux/s390x` | ✗ | ✗ | — |
-
-| 不支持的平台 | 原因 |
+| 写法 | 原因 |
 |---|---|
-| `linux/386` | Alpine 配方 `arch="all !s390x !x86"`（`x86` 指 32 位 i386） |
-| `linux/s390x` | 同上 |
-| `linux/arm/v6` | armhf 被 `py3-flatbuffers` 挡住，无 `py3-onnxruntime` |
+| `apk add $(cat /w1/system-packages.txt)` | 清单是 wheelhouse 的运行时前置条件（解释器与 `libz`），写错会在这里构建失败 |
+| `--no-index --find-links` | wheelhouse 提供的包**只**从本地取。`--no-index` 让 PyPI 完全不参与，缺件就是构建失败，而不是静默回落到 PyPI 的同名包（PyPI 的 onnxruntime 没有 cp314 的 musllinux 轮子，真回落会在源码编译那步失败，报错还指向别处） |
+| `--no-deps` | 只装 wheel 本体，传递依赖显式列在下一步，不让解析器自己去找 |
+| 第二步走 PyPI | 纯 Python 依赖各架构都有轮子，从 PyPI 取即可 |
+| `uv pip check` | 上游新增依赖而这一步的清单没跟上时，构建直接失败 |
 
-loong64 构建需 `--build-arg BASE_IMAGE=ghcr.io/loong64/alpine:3.24`（该仓库有同版本 `py3-onnxruntime` / `py3-numpy`）。
+每个 `--find-links` 给一份 wheelhouse 即可：每个包只属于一个 wheelhouse、版本也钉死，
+不存在歧义。若同一个包出现在多个 wheelhouse 且版本不同，flat 索引没有优先级，那时改用
+PEP 503 索引（`--extra-index-url file:///w1/simple`，按定义顺序查询，第一个含该包的胜出）。
 
-## 镜像体积
-
-| 镜像 | 首次拉取 | 占用磁盘 | 容器内 |
-|---|---|---|---|
-| `1.24.4-wheelhouse`（arm64） | 26.0 MiB | 54.8 MB | 26 MiB |
-| `1.24.4`（arm64） | 64.5 MiB | 287 MB | 181 MB（site-packages 128 MB） |
-| `1.24.4`（armv7） | — | 237 MB | 103 MB |
-
-`占用磁盘` 取 `docker images` 口径：containerd 计入解压层与压缩 blob 两份。
-
-## 产物
-
-```
-onnxruntime-<ver>-cpXXX-cpXXX-musllinux_1_2_<arch>.whl
-numpy-<ver>-cpXXX-cpXXX-musllinux_1_2_<arch>.whl
-SHA256SUMS
-system-packages.txt
-simple/
-  index.html
-  <project>/index.html
-```
-
-`system-packages.txt` 是需要 `apk add` 的运行时包（wheel 已自带全部 C 库，这里只剩解释器与数据文件），
-构建期用它装 runtime 镜像，下游照单安装即可。
-
-`simple/` 由 `src/pack_wheel.py --emit-index` 生成，链接为相对路径（`../../<wheel>#sha256=`），可与 wheel 目录一起挂到任意位置。
-
+`/w1/simple` 是 PEP 503 索引，链接为相对路径，可与 wheel 目录一起挂到任意位置。
 | 标签 | 含义 | PyPI 接受 |
 |---|---|---|
 | `musllinux_1_2_<arch>` | 在 musl ≥ 1.2 上构建，除 musl 外不依赖系统库 | 是 |
