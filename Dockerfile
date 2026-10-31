@@ -94,6 +94,7 @@ RUN apk add --no-cache \
         binutils \
         patchelf \
         py3-numpy \
+        py3-numpy-dev \
         py3-onnxruntime \
         py3-pip \
         py3-wheel \
@@ -109,7 +110,7 @@ RUN set -eux; \
         ${pip_args} "auditwheel==${AUDITWHEEL_VERSION}"; \
     python3 -m auditwheel --version
 
-COPY pack_wheel.py /usr/local/bin/pack_wheel.py
+COPY src/pack_wheel.py /usr/local/bin/pack_wheel.py
 
 # 两个包都走同一条 --from-apk 路径，产物落在同一个 /wheels：
 #   numpy         —— 包内 .so 是真文件，原样交给 auditwheel

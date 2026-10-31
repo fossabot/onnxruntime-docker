@@ -96,7 +96,7 @@ simple/
   <project>/index.html
 ```
 
-`simple/` 由 `pack_wheel.py --emit-index` 生成，链接为相对路径（`../../<wheel>#sha256=`），可与 wheel 目录一起挂到任意位置。
+`simple/` 由 `src/pack_wheel.py --emit-index` 生成，链接为相对路径（`../../<wheel>#sha256=`），可与 wheel 目录一起挂到任意位置。
 
 | 标签 | 含义 | PyPI 接受 |
 |---|---|---|
@@ -195,7 +195,7 @@ OCR 与数据处理不走 BLAS，未按架构拆分。
 </details>
 
 <details>
-<summary>pack_wheel.py</summary>
+<summary>src/pack_wheel.py</summary>
 
 三个入口：`--wheel-dir`（已归档的源码路径）、`--from-apk`（当前路径，`--package` 选包）、`--emit-index`（生成 PEP 503 索引）。保留的两步：解引用 apk 里的符号链接、按 SONAME 改名（`libonnxruntime.so.1.24.4` → `libonnxruntime.so.1`）；软链不能进 wheel，`package_data` 会跟随软链导致同一份内容打两遍。
 
