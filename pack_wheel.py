@@ -320,6 +320,22 @@ def write_dist_info(unroot: Path, meta_dir: Path, version: str, package: str) ->
         if entries.exists():
             shutil.copyfile(entries, dist_info / "entry_points.txt")
 
+    # PEP 639：METADATA 的 License-File 指向 dist-info/licenses/ 下的文件。
+    # apk 打包时可能少打某些文件（numpy 的 libdivide/LICENSE.txt 就是），留着会让
+    # pip 安装时告警，这里剔除指向不存在文件的条目。
+    metadata = dist_info / "METADATA"
+    if metadata.exists():
+        lines = metadata.read_text(encoding="utf-8").splitlines()
+        kept = [
+            line
+            for line in lines
+            if not line.startswith("License-File:")
+            or (dist_info / "licenses" / line.split(":", 1)[1].strip()).exists()
+        ]
+        if len(kept) != len(lines):
+            metadata.write_text("\n".join(kept) + "\n", encoding="utf-8")
+            print(f"  METADATA 剔除 {len(lines) - len(kept)} 条悬空的 License-File", flush=True)
+
     # 这里的 plat_name 只是「打包机的平台」，进过 auditwheel 后会被改成
     # musllinux_1_2_<arch>，两头一致才有意义，所以照旧写 sysconfig 的值。
     (dist_info / "WHEEL").write_text(

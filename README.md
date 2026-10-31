@@ -170,7 +170,6 @@ OCR 与数据处理不走 BLAS，未按架构拆分。
 
 - 只含 `icu-data-en`（2.9 MB）。`libre2` 处理非英语 Unicode 字符类需 `apk add icu-data-full`（+31.6 MB）。
 - sympy + mpmath 是 runtime 镜像里最大的一块，onnxruntime 的硬依赖，去掉会破坏形状推断。
-- numpy 的 dist-info 有一条 `License-File` 指向 apk 未打包的目录，安装时 pip 告警但不失败。
 - wheel 的 zip 条目带 mtime，构建不可逐字节复现；内容一致，`sha256` 每次不同。
 
 ## 维护者
