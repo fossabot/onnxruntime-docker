@@ -6,6 +6,10 @@
 * ``--from-apk``（重打包路径，Dockerfile 用）：直接吃 Alpine 官方包
   装进 site-packages 的目录树（``--package`` 指定包名，默认 onnxruntime），
   组装成 wheel 树后修复打包。目前已用于 onnxruntime 与 numpy。
+* ``--emit-index``（收尾，Dockerfile 用）：为 ``--out-dir`` 里已有的 wheel 生成
+  PEP 503 索引 ``simple/``，供 uv/pip 用 ``--extra-index-url file:///wheels/simple``
+  消费。链接是相对路径（``../../<wheel>``），所以挂到任何目录都成立，且多个
+  wheelhouse 可以各带一份索引、由 ``--extra-index-url`` 叠加（顺序即优先级）。
 
 依赖收集（DT_NEEDED 递归闭包）与 RPATH 全部交给 ``auditwheel repair``：
 它会把 abseil / re2 / protobuf / icu 这类非系统库改名塞进 ``onnxruntime.libs/``，
@@ -41,6 +45,7 @@ auditwheel 的 policy 不靠 ``--plat`` 硬编码：它从 ELF 的 interpreter �
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 import shutil
@@ -367,6 +372,52 @@ def from_apk(site_packages: Path, out_dir: Path, package: str, expect_version: s
         shutil.rmtree(work, ignore_errors=True)
 
 
+def emit_index(root: Path) -> int:
+    """为 root 下的 wheel 生成 PEP 503 索引，写入 root/simple/。
+
+    链接用相对路径 ``../../<wheel>#sha256=...``，所以索引与 wheel 的相对位置
+    固定（simple/<name> -> 上两级），但整个目录可以被挂载到任意路径。
+    重复执行会重建 simple/，不会残留上一次的项目目录。
+    """
+    wheels = sorted(root.glob("*.whl"))
+    if not wheels:
+        return die(f"{root} 下没有 .whl，无法生成索引")
+
+    simple = root / "simple"
+    if simple.exists():
+        shutil.rmtree(simple)
+
+    projects: dict[str, list[Path]] = {}
+    for wheel in wheels:
+        # wheel 文件名首段是 distribution（PEP 427 要求其中的 - 已经换成 _）
+        projects.setdefault(normalize_name(wheel.name.split("-")[0]), []).append(wheel)
+
+    for name, files in sorted(projects.items()):
+        page = simple / name
+        page.mkdir(parents=True)
+        links = "\n".join(
+            f'    <a href="../../{w.name}#sha256={hashlib.sha256(w.read_bytes()).hexdigest()}">{w.name}</a><br/>'
+            for w in files
+        )
+        (page / "index.html").write_text(
+            f'<!DOCTYPE html>\n<html>\n  <head><meta charset="utf-8"/><title>{name}</title></head>\n'
+            f"  <body>\n{links}\n  </body>\n</html>\n",
+            encoding="utf-8",
+        )
+
+    links = "\n".join(f'    <a href="{n}/">{n}</a><br/>' for n in sorted(projects))
+    (simple / "index.html").write_text(
+        "<!DOCTYPE html>\n<html>\n  <head><meta charset=\"utf-8\"/><title>Simple index</title></head>\n"
+        f"  <body>\n{links}\n  </body>\n</html>\n",
+        encoding="utf-8",
+    )
+
+    print(f"索引: {simple}（{len(projects)} 个项目 / {len(wheels)} 个 wheel）", flush=True)
+    for name, files in sorted(projects.items()):
+        print(f"  {name}: {len(files)}", flush=True)
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--wheel-dir", help="含单个 setup.py 产物 wheel 的目录（源码路径）")
@@ -380,7 +431,12 @@ def main() -> int:
         default="onnxruntime",
         help="要重打包的包名（--from-apk 用），如 onnxruntime / numpy",
     )
-    ap.add_argument("--out-dir", required=True, help="最终 wheel 输出目录")
+    ap.add_argument(
+        "--emit-index",
+        action="store_true",
+        help="只为 --out-dir 里已有的 wheel 生成 PEP 503 索引（simple/），不打包",
+    )
+    ap.add_argument("--out-dir", required=True, help="wheel 输出目录；--emit-index 时为索引所在目录")
     ap.add_argument(
         "--lib-dir",
         default="",
@@ -393,10 +449,13 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    if bool(args.wheel_dir) == bool(args.from_apk):
-        return die("--wheel-dir 与 --from-apk 必须且只能给一个")
+    modes = [bool(args.wheel_dir), bool(args.from_apk), bool(args.emit_index)]
+    if sum(modes) != 1:
+        return die("--wheel-dir / --from-apk / --emit-index 必须且只能给一个")
 
     out_dir = Path(args.out_dir).resolve()
+    if args.emit_index:
+        return emit_index(out_dir)
     if args.from_apk:
         return from_apk(Path(args.from_apk).resolve(), out_dir, args.package, args.expect_version)
 

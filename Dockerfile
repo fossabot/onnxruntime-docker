@@ -126,6 +126,7 @@ RUN set -eux; \
         --package onnxruntime \
         --out-dir /wheels \
         --expect-version "${ONNX_VERSION}"; \
+    python3 /usr/local/bin/pack_wheel.py --emit-index --out-dir /wheels; \
     cd /wheels; \
     ls -l; \
     sha256sum ./*.whl > SHA256SUMS; \

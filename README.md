@@ -14,18 +14,25 @@
 
 ## 快速开始
 
-取 wheel 自己组装。推荐 bind mount——`/wheels` 只在那一条 `RUN` 里存在，不进镜像层：
+取 wheel 自己组装。wheelhouse 里有 PEP 503 索引，`requirements.txt` 照常写依赖即可——
+索引里有的从本地取，其余落 PyPI：
 
 ```dockerfile
 # syntax=docker/dockerfile:1
 FROM alpine:3.24
 RUN apk add --no-cache python3 uv
-RUN --mount=type=bind,from=a76yyyy/onnxruntime:1.24.4-wheelhouse,source=/wheels,target=/wheels \
+RUN --mount=type=bind,from=a76yyyy/onnxruntime:1.24.4-wheelhouse,source=/wheels,target=/w \
     uv pip install --system --break-system-packages --no-cache \
-        --no-index --find-links /wheels numpy==2.4.6 && \
-    uv pip install --system --break-system-packages --no-cache \
-        --find-links /wheels onnxruntime==1.24.4
+        --index-url https://pypi.org/simple \
+        --extra-index-url file:///w/simple \
+        -r requirements.txt
 ```
+
+- 本地索引放在 `--extra-index-url`：uv 的索引按定义顺序查询，默认索引（PyPI）永远最低优先级
+- 索引页里的链接是相对路径，挂到 `/w` 还是 `/wheels` 都成立
+- 本地有该包但版本不满足时解析直接失败，不会静默改从 PyPI 装另一个版本
+
+全本地、零外网时改用 `--no-index --find-links /w`（`/w` 下仍是平铺的 wheel）。
 
 需要 BuildKit（首行 `# syntax=docker/dockerfile:1`，Docker 23 起默认启用）。构建器不支持
 `RUN --mount`（如 Kaniko）或运行时还要用 `/wheels` 时，改用 COPY：
@@ -48,13 +55,16 @@ RUN apk add --no-cache python3 uv && \
 | `RUN --mount=type=bind,from=<wheelhouse>` | 279 MB | 否 |
 | `COPY --from=<wheelhouse> /wheels` | 334 MB | 是（`rm` 无效：COPY 与 RUN 是两层） |
 
-多个 wheelhouse 可一次挂载（`--mount` 与 `--find-links` 都可重复，`from=` 直接写镜像名）：
+多个 wheelhouse 叠加（`--mount` 与 `--extra-index-url` 都可重复，顺序即优先级）：
 
 ```dockerfile
 RUN --mount=type=bind,from=a76yyyy/onnxruntime:1.24.4-wheelhouse,source=/wheels,target=/w/a \
     --mount=type=bind,from=<其他 wheelhouse 镜像>,source=/wheels,target=/w/b \
     uv pip install --system --break-system-packages --no-cache \
-        --find-links /w/a --find-links /w/b onnxruntime==1.24.4 numpy==2.4.6
+        --index-url https://pypi.org/simple \
+        --extra-index-url file:///w/a/simple \
+        --extra-index-url file:///w/b/simple \
+        -r requirements.txt
 ```
 
 直接基于 runtime 镜像：
@@ -119,7 +129,13 @@ wheel 自包含，装进干净的 alpine 即可 import 并推理，不需要 apk
 onnxruntime-<ver>-cpXXX-cpXXX-musllinux_1_2_<arch>.whl
 numpy-<ver>-cpXXX-cpXXX-musllinux_1_2_<arch>.whl
 SHA256SUMS
+simple/
+  index.html                     # 项目列表
+  <project>/index.html           # 指向 ../../<wheel>#sha256=...
 ```
+
+`simple/` 是 PEP 503 索引，由 `pack_wheel.py --emit-index` 在打包末尾生成。链接用相对路径，
+整份 wheelhouse 可挂到任意目录；平铺的 wheel 保留在原处，`--find-links` 的用法不受影响。
 
 标签由 `auditwheel repair` 生成。
 
@@ -161,8 +177,9 @@ docker buildx build --platform linux/arm64 --target runtime \
   `loongarch64` 缺失，源装需要编译器，runtime 镜像没有
 - 六个架构都自建（`--from-apk --package numpy`），保证同一份产物、消费者只写一条安装命令
 
-`--no-index` 只给 numpy 那一行：不加的话 uv 会在 `x86_64` / `aarch64` 上静默改走 PyPI，
-自建的那份不被验证。
+本地索引负责「优先用自建的 numpy」：它排在 PyPI 之前，同样的版本号一定从本地取。
+若改用 `--find-links`（无优先级保证），`x86_64` / `aarch64` 上 uv 可能静默改走 PyPI，
+自建的那份反而没被验证——这是早期用 `--no-index` 强制的原因。
 
 自建版与 PyPI 官方轮子的差异：
 
