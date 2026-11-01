@@ -71,6 +71,7 @@ on:
 env:
   PUBLISH: ${{ inputs.push || startsWith(github.ref, 'refs/tags/') }}
   IMAGE: docker.io/a76yyyy/onnxruntime
+  GHCR_IMAGE: ghcr.io/qd-today/onnxruntime
   # 默认平台 = 可用平台全集。这 6 个是实测「apk 有 py3-onnxruntime + py3-numpy，
   # 且 numpy 线性代数在干净镜像里可用」的组合。
   #
@@ -214,7 +215,11 @@ jobs:
           # 一条 `--output`，不会出现「--push 又叠加一个 type=image」的二义性。
           # 实测：`type=image,...,push-by-digest=true,name-canonical=true` 不带
           # push=true 时只写本地镜像库、**不会**推送，加其余参数是必需的。
-          outputs: ${{ env.PUBLISH == 'true' && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.IMAGE) || 'type=local,dest=./dist' }}
+          # 两个 registry 各推一份 digest：层直接推给 ghcr，publish 阶段才能用
+          # 「各自的 registry 作为源」合并 manifest——跨 registry 复制层会被 ghcr 拒绝。
+          outputs: |
+            ${{ env.PUBLISH == 'true' && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.IMAGE) || 'type=local,dest=./dist' }}
+            ${{ env.PUBLISH == 'true' && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.GHCR_IMAGE) || 'type=local,dest=./dist-ghcr' }}
           build-args: ${{ steps.args.outputs.build_args }}
           # 不产 attestation 清单，保持 manifest 只有平台条目（旧客户端兼容）
           provenance: false
@@ -233,7 +238,9 @@ jobs:
           platforms: ${{ matrix.platform }}
           # 与上面 wheelhouse 一步完全同构（此步只在发布模式跑）：两个出口各自
           # 拿到独立的单平台 digest
-          outputs: ${{ format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.IMAGE) }}
+          outputs: |
+            ${{ format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.IMAGE) }}
+            ${{ format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.GHCR_IMAGE) }}
           build-args: ${{ steps.args.outputs.build_args }}
           provenance: false
           # 第一条来自上面 wheelhouse 的导出（复用 repack 阶段），第二条是本 target
@@ -425,6 +432,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Login to Docker Hub
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.GHCR_TOKEN || github.actor }}
+          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
         uses: docker/login-action@v3
         with:
           registry: docker.io
@@ -442,17 +455,20 @@ jobs:
           merge_one() {
             dir="$1"; shift
             SRCS=""
+            GHCR_SRCS=""
             for f in "$dir"/*.digest; do
               SRCS="$SRCS ${IMAGE}@$(cat "$f")"
+              GHCR_SRCS="$GHCR_SRCS ${GHCR_IMAGE}@$(cat "$f")"
             done
             echo "聚合来源 $dir:${SRCS}"
             for TAG in "$@"; do
               echo "::group::合并 -> ${IMAGE}:${TAG}"
               docker buildx imagetools create -t "${IMAGE}:${TAG}" $SRCS
-              # 同一批 tag 也挂到 ghcr：两个 registry 内容一致，manifest digest 相同
-              echo "::group::同步 -> ${GHCR_IMAGE}:${TAG}"
-              docker buildx imagetools create -t "${GHCR_IMAGE}:${TAG}" $SRCS
               echo "::endgroup::"
+              # ghcr 的 manifest 用 ghcr 自己的 digest 聚合：源与目标同 registry，
+              # 不用跨 registry 复制层（ghcr 不接受来自别的 registry 的 blob 挂载）
+              echo "::group::同步 -> ${GHCR_IMAGE}:${TAG}"
+              docker buildx imagetools create -t "${GHCR_IMAGE}:${TAG}" $GHCR_SRCS
               echo "::endgroup::"
             done
           }
