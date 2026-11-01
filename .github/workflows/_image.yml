@@ -75,7 +75,8 @@ on:
 env:
   PUBLISH: ${{ inputs.push || startsWith(github.ref, 'refs/tags/') }}
   IMAGE: docker.io/a76yyyy/onnxruntime
-  GHCR_IMAGE: ghcr.io/qd-today/onnxruntime
+  # 与仓库同名：ghcr 上只保留同名 package，避免 onnxruntime / onnxruntime-docker 两份
+  GHCR_IMAGE: ghcr.io/qd-today/onnxruntime-docker
   # 默认平台 = 可用平台全集。这 6 个是实测「apk 有 py3-onnxruntime + py3-numpy，
   # 且 numpy 线性代数在干净镜像里可用」的组合。
   #
