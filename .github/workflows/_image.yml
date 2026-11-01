@@ -106,10 +106,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Lint workflow files
-        run: |
-          set -euo pipefail
-          pip install --quiet actionlint-py
-          actionlint -no-color
+        uses: rhysd/actionlint@v1
       - name: Check version consistency
         run: |
           # 版本号只有一个源头：Dockerfile 的 ARG 默认值。README 里的是它的副本，
