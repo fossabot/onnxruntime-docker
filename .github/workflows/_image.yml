@@ -450,7 +450,6 @@ jobs:
           password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
       - name: Create multi-arch manifests
         env:
-          GHCR_IMAGE: ghcr.io/qd-today/onnxruntime
           VERSION: ${{ inputs.onnx_version }}
         run: |
           set -euo pipefail
@@ -487,7 +486,6 @@ jobs:
       - name: Verify manifest platform completeness
         env:
           EXPECTED: ${ needs.plan.outputs.expected }
-          GHCR_IMAGE: ghcr.io/qd-today/onnxruntime
         # 合并后回读 manifest：digest 数量对不等于 manifest 里平台对（历史上有过
         # 同一平台被合并两次、另一平台被吞掉的情况），所以按集合比对而不是按数量
         run: |
