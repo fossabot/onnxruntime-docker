@@ -67,6 +67,10 @@ on:
         required: false
       DOCKER_PASSWORD:
         required: false
+      # ghcr 用它；没有就用 GITHUB_TOKEN（reusable workflow 里 secrets 必须显式声明，
+      # 否则 GitHub 拒绝解析整个 workflow，run 会立即失败且不产生任何 job）
+      GHCR_TOKEN:
+        required: false
 
 env:
   PUBLISH: ${{ inputs.push || startsWith(github.ref, 'refs/tags/') }}
@@ -101,6 +105,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Lint workflow files
+        run: |
+          set -euo pipefail
+          pip install --quiet actionlint-py
+          actionlint -no-color
       - name: Check version consistency
         run: |
           # 版本号只有一个源头：Dockerfile 的 ARG 默认值。README 里的是它的副本，
@@ -432,17 +441,17 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ secrets.GHCR_TOKEN || github.actor }}
           password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
-        uses: docker/login-action@v3
-        with:
-          registry: docker.io
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
       - name: Create multi-arch manifests
         env:
           GHCR_IMAGE: ghcr.io/qd-today/onnxruntime
