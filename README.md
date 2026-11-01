@@ -110,6 +110,25 @@ OCR 与数据处理不走 BLAS，未按架构拆分。
 ## 维护者
 
 <details>
+<summary>版本参数</summary>
+
+上游发新版时，改这里或 dispatch 时传同名输入即可构建新版本；产物版本与传入版本不一致时
+构建失败（`--expect-version` 断言）。
+
+| 参数 | 作用 | 默认值 |
+|---|---|---|
+| `onnx_version` | onnxruntime 版本，同时是 runtime 镜像的 tag | 1.24.4 |
+| `numpy_version` | numpy 版本（决定 wheelhouse 里那个 numpy wheel） | 2.4.6 |
+| `alpine_version` | alpine 版本，决定 Python 小版本与 wheel 的 cpXX tag | 3.24 |
+
+这两个包来自 Alpine 的 apk 预编译包（`py3-onnxruntime` / `py3-numpy`），版本受 apk 仓限制：
+参数只能钉住 apk 里已有的版本，apk 更新后再改这里（版本对不上时构建会在断言处失败，
+不会产出错标版本的 wheel）。PyPI 的 musllinux 轮子只覆盖 x86_64 与 aarch64，其余架构
+只能走 apk 或自行源码构建。
+
+</details>
+
+<details>
 <summary>CI 结构</summary>
 
 `.github/workflows/_image.yml` 为共享 workflow，`Build Image.yml` 为调用方，四段：plan → build → smoke → publish。
