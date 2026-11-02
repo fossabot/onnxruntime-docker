@@ -143,6 +143,30 @@ FROM scratch AS wheel
 COPY --from=repack /wheels/ /wheels/
 
 ########################################################################
+# 编译产物（两段式构建的第一段导出物）
+#
+# 与 pycurl-docker / ddddocr-docker 的 Dockerfile 同构。本仓库 runtime 不需要额外
+# 二进制，产物只有 /wheels。
+#
+#   docker buildx build --target artifacts --output type=local,dest=dist .
+########################################################################
+FROM scratch AS artifacts
+
+COPY --from=repack /wheels/ /wheels/
+
+########################################################################
+# 外部产物注入点（--build-context wheelsrc=<dist>）
+########################################################################
+FROM scratch AS wheelsrc
+
+########################################################################
+# 从产物构造 wheelhouse 镜像（两段式的第二段，不需要重新重打包）
+########################################################################
+FROM scratch AS wheel-from-artifacts
+
+COPY --from=wheelsrc /wheels /wheels
+
+########################################################################
 # 运行时出口：自带 numpy / onnxruntime 的可运行镜像，不依赖 apk 的 py3-numpy
 #
 # 为什么不用 `COPY --from=repack /wheels /wheels` + `RUN rm -rf /wheels`：
@@ -173,10 +197,6 @@ RUN if [ -n "${APK_MIRROR}" ]; then \
 # libstdc++ / libgcc_s / openblas 之类收在自己的 .libs 下，与 python3 无关）。
 # **不能**再装 py3-numpy —— numpy 只从 wheelhouse 来，这正是本文件要证明的事。
 # 直接按 wheelhouse 里的清单装：清单写错会在这里构建失败，不会等到上层才发现。
-# uv 是工具不是运行时依赖，单独列出。
-RUN --mount=type=bind,from=repack,source=/wheels,target=/w \
-    apk add --no-cache $(cat /w/system-packages.txt) uv
-
 # 装包：本地 wheelhouse 的索引优先，PyPI 兜底纯 Python 依赖。
 #
 # 索引优先级（uv 官方口径 + 实测）：`--index-url` 指定的默认索引是最低优先级，
@@ -186,8 +206,11 @@ RUN --mount=type=bind,from=repack,source=/wheels,target=/w \
 #
 # `--no-cache` 不是省事，是必须：uv 默认把解压后的包再存一份到 /root/.cache/uv，
 # 会原样进镜像层（实测多出 130MB，比两个包本身还大）。
-RUN --mount=type=bind,from=repack,source=/wheels,target=/wheels \
+# uv 是工具不是运行时依赖：装包和删除放在同一个 RUN 里。它是 27 MiB 的独立二进制，
+# 留着白占体积；分两层删除无效（字节仍留在下层）。
+RUN --mount=type=bind,from=wheelsrc,source=wheels,target=/wheels \
     set -eux; \
+    apk add --no-cache $(cat /wheels/system-packages.txt) uv; \
     uv pip install --system --break-system-packages --no-cache \
         --index-url "${PIP_MIRROR:-https://pypi.org/simple}" \
         --extra-index-url file:///wheels/simple \
@@ -196,7 +219,8 @@ RUN --mount=type=bind,from=repack,source=/wheels,target=/wheels \
     python3 -c "import onnxruntime, numpy; \
 print('onnxruntime', onnxruntime.__version__, onnxruntime.get_available_providers()); \
 print('numpy', numpy.__version__)"; \
-    rm -rf /tmp/uv-* /root/.cache/uv
+    rm -rf /tmp/uv-* /root/.cache/uv; \
+    apk del uv
 
 # runtime 是给上层 FROM 的基座，`docker run <image>` 打一次版本自检
 CMD ["python3", "-c", "import onnxruntime, numpy; print('onnxruntime', onnxruntime.__version__, '| numpy', numpy.__version__)"]

@@ -101,7 +101,8 @@ jobs:
     permissions:
       contents: read
     outputs:
-      matrix: ${{ steps.plan.outputs.matrix }}
+      wheel_matrix: ${{ steps.plan.outputs.wheel_matrix }}
+      runtime_matrix: ${{ steps.plan.outputs.runtime_matrix }}
       smoke_matrix: ${{ steps.plan.outputs.smoke_matrix }}
       expected: ${{ steps.plan.outputs.expected }}
       full: ${{ steps.plan.outputs.full }}
@@ -126,24 +127,28 @@ jobs:
           set -euo pipefail
           python3 .github/workflows/scripts/plan.py > /tmp/plan.out
           echo "--- 构建矩阵 ---"
-          sed -n 's/^matrix=//p' /tmp/plan.out | python3 -m json.tool
+          echo "--- wheel 矩阵 ---"
+          sed -n 's/^wheel_matrix=//p' /tmp/plan.out | python3 -m json.tool
+          echo "--- runtime 矩阵 ---"
+          sed -n 's/^runtime_matrix=//p' /tmp/plan.out | python3 -m json.tool
           echo "--- 其余 ---"
           grep -Ev '^(matrix|smoke_matrix)=' /tmp/plan.out
           cat /tmp/plan.out >> "$GITHUB_OUTPUT"
 
-  build:
+  # 第一段：重打包 wheel，产物导出成 artifact。与 pycurl-docker / ddddocr-docker 同构。
+  #
+  # 按平台拆 job 是硬约束（--output type=local 不支持多平台）。arm 系列都放原生 arm64：
+  # 重打包不受 compat 模式影响，但装 wheel 不能在那儿做——见第二段说明。
+  build-wheel:
     needs: plan
-    name: Build ${{ matrix.platform }}
+    name: Wheel ${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
-    # 原生架构 repackage 约 1 分钟；QEMU 架构要模拟 apk 安装 + auditwheel，
-    # 给到 GitHub 单 job 上限附近，避免慢架构被超时误杀
-    timeout-minutes: 360
+    timeout-minutes: 60
     permissions:
       contents: read
-      packages: write
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+      matrix: ${{ fromJSON(needs.plan.outputs.wheel_matrix) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -164,11 +169,102 @@ jobs:
           done
           echo "出口 stage 齐全（wheel + runtime）"
       - name: Set up QEMU
-        # 非本机架构（如 ubuntu-latest 上的 riscv64）要靠 binfmt 才能执行 RUN 里的
-        # apk / python
         uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+      - name: Compute build args
+        id: args
+        # 不能直接把 BASE_IMAGE 写进 build-args：非 loong64 平台该值为空，
+        # 而空的 `FROM ` 会直接报错。这里只在需要时追加这一行。
+        env:
+          BASE_IMAGE: ${{ matrix.base_image }}
+          ALPINE: ${{ inputs.alpine_version }}
+          ONNX: ${{ inputs.onnx_version }}
+          NUMPY: ${{ inputs.numpy_version }}
+          APK_MIRROR: ${{ inputs.apk_mirror }}
+        run: |
+          set -euo pipefail
+          {
+            echo "build_args<<__BUILD_ARGS__"
+            echo "ALPINE_VERSION=${ALPINE}"
+            echo "ONNX_VERSION=${ONNX}"
+            echo "NUMPY_VERSION=${NUMPY}"
+            echo "APK_MIRROR=${APK_MIRROR}"
+            if [ -n "${BASE_IMAGE}" ]; then
+              echo "BASE_IMAGE=${BASE_IMAGE}"
+            fi
+            echo "__BUILD_ARGS__"
+          } >> "$GITHUB_OUTPUT"
+          echo "构建参数：ALPINE_VERSION=${ALPINE} ONNX_VERSION=${ONNX} NUMPY_VERSION=${NUMPY} BASE_IMAGE=${BASE_IMAGE:-（默认）}"
+      - name: Build artifacts
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          # artifacts 出口目前只有 /wheels；两段式的第二段全靠它
+          target: artifacts
+          platforms: ${{ matrix.platform }}
+          outputs: type=local,dest=./dist
+          build-args: ${{ steps.args.outputs.build_args }}
+          provenance: false
+          cache-from: type=gha,scope=onnxruntime-${{ matrix.group }}${{ inputs.cache_bust }}
+          cache-to: type=gha,mode=max,scope=onnxruntime-${{ matrix.group }}${{ inputs.cache_bust }},ignore-error=true
+      - name: Show artifacts
+        run: |
+          set -euo pipefail
+          ls -l dist/wheels
+          cat dist/wheels/SHA256SUMS
+          echo "--- system-packages.txt ---"
+          cat dist/wheels/system-packages.txt
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-${{ matrix.group }}
+          path: dist
+          retention-days: 1
+          if-no-files-found: error
+
+  # 第二段：用第一段的产物组装 wheelhouse 与 runtime，推 digest。
+  #
+  # 统一跑 x86_64。arm64 runner 走内核 compat 模式时 Python 自报 linux-aarch64，
+  # uv 在那装 wheel 会挂死（pycurl-docker 实测：x86_64 上两版 uv 都 1-2 秒通过，
+  # arm64 runner 上两版都超时，只有 pip 能过）。
+  build:
+    needs: [plan, build-wheel]
+    name: Runtime ${{ matrix.platform }}
+    if: ${{ needs.build-wheel.result == 'success' }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.runtime_matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: artifacts-${{ matrix.group }}
+          path: ./dist
+      - name: Guard - dockerfile exposes both exits
+        # 双出口流水线要求 Dockerfile 同时有 `wheel` 与 `runtime` 两个 stage，
+        # 缺一个时 buildx 只会报 "target stage ... could not be found"，看不懂；
+        # 这里提前给出明确错误
+        env:
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        run: |
+          set -euo pipefail
+          for stage in wheel runtime; do
+            if ! grep -qE "^FROM[[:space:]].*[[:space:]]AS[[:space:]]+${stage}[[:space:]]*$" "$DOCKERFILE"; then
+              echo "::error::${DOCKERFILE} 没有 \`AS ${stage}\` 出口 stage，双出口流水线无法构建。"
+              echo "::error::wheel 出口用于产出 wheelhouse 镜像，runtime 出口用于产出可运行镜像与冒烟。"
+              exit 1
+            fi
+          done
+          echo "出口 stage 齐全（wheel + runtime）"
       - name: Login to Docker Hub
         if: env.PUBLISH == 'true'
         uses: docker/login-action@v3
@@ -182,6 +278,10 @@ jobs:
           registry: ghcr.io
           username: ${{ secrets.GHCR_TOKEN || github.actor }}
           password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
       - name: Compute build args
         id: args
         # 不能直接把 BASE_IMAGE 写进 build-args：非 loong64 平台该值为空，
@@ -211,59 +311,40 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./${{ inputs.dockerfile }}
-          # 只到 wheel 阶段：产物就是这个 scratch 镜像里的 /wheels
-          target: wheel
+          file: ./Dockerfile
+          # 从产物重建 wheelhouse：不再重打包，秒级完成
+          target: wheel-from-artifacts
           platforms: ${{ matrix.platform }}
-          # 发布模式按 digest 推送：各平台并行构建，用 digest 传递产物不必协调 tag
-          # 命名，也不在 tag 列表里留下对使用者无意义、却可被拉取的中间产物。
-          # 非发布模式落盘，作为 wheel 产物留给人工取用。
-          #
-          # 推送开关写在 outputs 里（push=true），不用 action 的 push 输入：这样只有
-          # 一条 `--output`，不会出现「--push 又叠加一个 type=image」的二义性。
-          # 实测：`type=image,...,push-by-digest=true,name-canonical=true` 不带
-          # push=true 时只写本地镜像库、**不会**推送，加其余参数是必需的。
-          # 两个 registry 各推一份 digest：层直接推给 ghcr，publish 阶段才能用
-          # 「各自的 registry 作为源」合并 manifest——跨 registry 复制层会被 ghcr 拒绝。
-          outputs: |
-            ${{ env.PUBLISH == 'true' && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.IMAGE) || 'type=local,dest=./dist' }}
-            ${{ env.PUBLISH == 'true' && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.GHCR_IMAGE) || 'type=local,dest=./dist-ghcr' }}
-          build-args: ${{ steps.args.outputs.build_args }}
-          # 不产 attestation 清单，保持 manifest 只有平台条目（旧客户端兼容）
-          provenance: false
-          cache-from: type=gha,scope=onnx-${{ matrix.group }}${{ inputs.cache_bust }}
-          cache-to: type=gha,mode=max,scope=onnx-${{ matrix.group }}${{ inputs.cache_bust }},ignore-error=true
-      - name: Build runtime image
-        if: env.PUBLISH == 'true'
-        id: runtime
-        # 发布模式才在这里构建：非发布模式下冒烟 job 会自己 `--load` 出来跑，
-        # 避免同一台 runner 上编译两遍（repack 阶段仍然从缓存命中）
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./${{ inputs.dockerfile }}
-          target: runtime
-          platforms: ${{ matrix.platform }}
-          # 与上面 wheelhouse 一步完全同构（此步只在发布模式跑）：两个出口各自
-          # 拿到独立的单平台 digest
+          build-contexts: |
+            wheelsrc=./dist
           outputs: |
             ${{ format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.IMAGE) }}
             ${{ format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.GHCR_IMAGE) }}
           build-args: ${{ steps.args.outputs.build_args }}
           provenance: false
-          # 第一条来自上面 wheelhouse 的导出（复用 repack 阶段），第二条是本 target
+          cache-from: type=gha,scope=onnxruntime-${{ matrix.group }}${{ inputs.cache_bust }}
+          cache-to: type=gha,mode=max,scope=onnxruntime-${{ matrix.group }}-runtime${{ inputs.cache_bust }},ignore-error=true
+      - name: Build runtime image
+        id: runtime
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: runtime
+          platforms: ${{ matrix.platform }}
+          build-contexts: |
+            wheelsrc=./dist
+          outputs: |
+            ${{ format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.IMAGE) }}
+            ${{ format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.GHCR_IMAGE) }}
+          build-args: ${{ steps.args.outputs.build_args }}
+          provenance: false
           cache-from: |
-            type=gha,scope=onnx-${{ matrix.group }}${{ inputs.cache_bust }}
-            type=gha,scope=onnx-${{ matrix.group }}-runtime${{ inputs.cache_bust }}
-          cache-to: type=gha,mode=max,scope=onnx-${{ matrix.group }}-runtime${{ inputs.cache_bust }},ignore-error=true
-      - name: Show wheel
-        if: env.PUBLISH != 'true'
-        # 顺带把 SHA256SUMS 打进日志：artifact 里存的就是这份清单，出问题时可追溯
-        run: ls -l dist/wheels && cat dist/wheels/SHA256SUMS
+            type=gha,scope=onnxruntime-${{ matrix.group }}${{ inputs.cache_bust }}
+            type=gha,scope=onnxruntime-${{ matrix.group }}-runtime${{ inputs.cache_bust }}
+          cache-to: type=gha,mode=max,scope=onnxruntime-${{ matrix.group }}-runtime${{ inputs.cache_bust }},ignore-error=true
       - name: Export digests
-        if: env.PUBLISH == 'true'
-        # 两个出口各一个 digest，分开目录存放，artifact 名也带出口名，
-        # 下游 publish 才能把两套 manifest 各自的 6 个 digest 分清楚
+        # 两个出口各一个 digest，分开目录存放，下游 publish 才能把两套 manifest 分清
         run: |
           set -eu
           mkdir -p /tmp/digests/wheelhouse /tmp/digests/runtime
@@ -272,7 +353,6 @@ jobs:
           echo "wheelhouse ${{ matrix.group }}: $(cat "/tmp/digests/wheelhouse/${{ matrix.group }}.digest")"
           echo "runtime    ${{ matrix.group }}: $(cat "/tmp/digests/runtime/${{ matrix.group }}.digest")"
       - name: Upload wheelhouse digest
-        if: env.PUBLISH == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: digest-wheelhouse-${{ matrix.group }}
@@ -280,20 +360,10 @@ jobs:
           retention-days: 1
           if-no-files-found: error
       - name: Upload runtime digest
-        if: env.PUBLISH == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: digest-runtime-${{ matrix.group }}
           path: /tmp/digests/runtime/*.digest
-          retention-days: 1
-          if-no-files-found: error
-      - name: Upload wheel
-        if: env.PUBLISH != 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          # artifact 名带平台，避免多平台互相覆盖
-          name: wheel-${{ matrix.group }}
-          path: dist/wheels
           retention-days: 1
           if-no-files-found: error
 

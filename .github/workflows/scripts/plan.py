@@ -34,8 +34,13 @@ dup = sorted({p for p in plats if plats.count(p) > 1})
 if dup:
     sys.exit("::error::平台重复: %s" % ",".join(dup))
 
+# 默认启用原生 arm64 runner，与 pycurl-docker / ddddocr-docker 一致。
+# 原来写的是 == "true"，而没有任何地方传 NATIVE_ARM，等于 arm 构建一直跑在 x86_64 上
+# 靠 QEMU。要临时退回 QEMU 时设 NATIVE_ARM=false。
 arm_runner = (
-    "ubuntu-24.04-arm" if os.environ.get("NATIVE_ARM") == "true" else "ubuntu-latest"
+    "ubuntu-latest"
+    if os.environ.get("NATIVE_ARM") == "false"
+    else "ubuntu-24.04-arm"
 )
 
 # wheel 文件名里的架构串（pack_wheel.py 用 uname -m 的值）。容器 tag 与日志里用它，
@@ -59,27 +64,37 @@ def base_of(platform: str) -> str:
     return ""
 
 
-def entry(platform: str) -> dict:
-    """一个平台一个 job，一个 job 里连着 build 两个 target：
+def wheel_entry(platform: str) -> dict:
+    """第一段：重打包 wheel，跑在最快的 runner 上。
 
-    * 重打包是秒级，两个平台并进同一个 buildx 调用没有必要，反而放大内存峰值；
-    * 两个 target 共用 `repack` 阶段，同一 builder 里第二次直接命中本地缓存，拆成两个
-      job 反而会把它做两遍；
-    * 单平台 push-by-digest 得到的是单平台 manifest digest，发布时按平台逐一合并，
-      冒烟也能按 digest 取回同一份字节。
+    arm 系列都放原生 arm64（与 pycurl-docker / ddddocr-docker 一致的模板）。
+    重打包本身不依赖 Python 的架构判断，所以在 compat 模式下也能正确产出 wheel；
+    **装** wheel 就不行——compat 模式下 Python 自报 linux-aarch64，uv 会挂死，
+    所以安装统一放在第二段的 x86_64 上。
     """
     return {
         "platform": platform,
         "group": platform.replace("linux/", "").replace("/", "-"),
         "arch": arch_map[platform],
-        "runner": arm_runner if platform == "linux/arm64" else "ubuntu-latest",
+        "runner": arm_runner
+        if platform in ("linux/arm64", "linux/arm/v7")
+        else "ubuntu-latest",
         "base_image": base_of(platform),
     }
 
 
-include = [entry(p) for p in plats]
+def runtime_entry(platform: str) -> dict:
+    """第二段：用第一段的产物组装 wheelhouse 与 runtime，统一跑 x86_64。"""
+    e = wheel_entry(platform)
+    e["runner"] = "ubuntu-latest"
+    return e
 
-print("matrix=" + json.dumps({"include": include}))
-print("smoke_matrix=" + json.dumps({"include": include}))
+
+wheel_matrix = [wheel_entry(p) for p in plats]
+runtime_matrix = [runtime_entry(p) for p in plats]
+
+print("wheel_matrix=" + json.dumps({"include": wheel_matrix}))
+print("runtime_matrix=" + json.dumps({"include": runtime_matrix}))
+print("smoke_matrix=" + json.dumps({"include": wheel_matrix}))
 print("expected=" + ",".join(sorted(plats)))
 print("full=%s" % str(sorted(plats) == sorted(default)).lower())
