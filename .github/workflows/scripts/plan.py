@@ -67,18 +67,16 @@ def base_of(platform: str) -> str:
 def wheel_entry(platform: str) -> dict:
     """第一段：重打包 wheel，跑在最快的 runner 上。
 
-    arm 系列都放原生 arm64（与 pycurl-docker / ddddocr-docker 一致的模板）。
-    重打包本身不依赖 Python 的架构判断，所以在 compat 模式下也能正确产出 wheel；
-    **装** wheel 就不行——compat 模式下 Python 自报 linux-aarch64，uv 会挂死，
-    所以安装统一放在第二段的 x86_64 上。
+    只有 arm64 放原生 arm64 runner。**armv7 必须留在 x86_64**：wheel 的名字由
+    Python 的 sysconfig.get_platform() 决定，而 compat 模式下 Python 自报 aarch64，
+    会让 arm32 的 wheel 被标成 linux_aarch64，auditwheel 随即失败（实测）。
+    这一点与 pycurl-docker 不同——那边的 wheel 名由 gcc target 决定，compat 下仍正确。
     """
     return {
         "platform": platform,
         "group": platform.replace("linux/", "").replace("/", "-"),
         "arch": arch_map[platform],
-        "runner": arm_runner
-        if platform in ("linux/arm64", "linux/arm/v7")
-        else "ubuntu-latest",
+        "runner": arm_runner if platform == "linux/arm64" else "ubuntu-latest",
         "base_image": base_of(platform),
     }
 
