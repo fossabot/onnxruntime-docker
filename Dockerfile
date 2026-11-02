@@ -49,6 +49,15 @@ ARG BASE_IMAGE=alpine:${ALPINE_VERSION}
 
 FROM ${BASE_IMAGE} AS repack
 
+# platform tag 由 CI 按目标平台算好传进来（plan.py 的 python_host_platform）。
+# 为什么必须在 ENV 而不是某条 RUN 里 export：arm 容器在原生 arm64 runner 上走内核
+# compat 模式时 uname 报 aarch64，Python 的 sysconfig.get_platform() 与 EXT_SUFFIX
+# 都会跟着错——cmake 生成的扩展模块名错、打包时按正确 tag 去找就找不到 .so，
+# auditwheel 报 'no ELF executable or shared library file'。改在 ENV 才覆盖全流程。
+ARG PYTHON_HOST_PLATFORM=""
+ENV _PYTHON_HOST_PLATFORM=${PYTHON_HOST_PLATFORM}
+
+
 ARG ONNX_VERSION=1.24.4
 ARG NUMPY_VERSION=2.4.6
 ARG APK_MIRROR=""
@@ -118,23 +127,6 @@ COPY system-packages.txt /wheels/system-packages.txt
 #   numpy         —— 包内 .so 是真文件，原样交给 auditwheel
 #   onnxruntime   —— capi 里是软链，多两步解引用 + 按 SONAME 命名
 RUN set -eux; \
-    # Python 的 sysconfig.get_platform() 读的是运行时 uname，而 arm 容器在原生 arm64
-    # runner 上走内核 compat 模式时 uname 报 aarch64，会让 arm32 的 wheel 被标成
-    # linux_aarch64（auditwheel 随即因 .so 与标签不符失败）。_PYTHON_HOST_PLATFORM 是
-    # Python 官方认的覆盖方式（sysconfig 与 distutils 都优先读它），这里按 Docker 提供的
-    # 目标平台参数推导，不硬编码单个架构、也不依赖运行时探测。
-    case "${TARGETARCH}${TARGETVARIANT:+/$TARGETVARIANT}" in \
-        arm64)   _PYTHON_HOST_PLATFORM=linux-aarch64 ;; \
-        arm/v7)  _PYTHON_HOST_PLATFORM=linux-armv7l ;; \
-        arm/v6)  _PYTHON_HOST_PLATFORM=linux-armv6l ;; \
-        amd64)   _PYTHON_HOST_PLATFORM=linux-x86_64 ;; \
-        386)     _PYTHON_HOST_PLATFORM=linux-i686 ;; \
-        ppc64le) _PYTHON_HOST_PLATFORM=linux-ppc64le ;; \
-        riscv64) _PYTHON_HOST_PLATFORM=linux-riscv64 ;; \
-        s390x)   _PYTHON_HOST_PLATFORM=linux-s390x ;; \
-        loong64) _PYTHON_HOST_PLATFORM=linux-loongarch64 ;; \
-    esac; \
-    export _PYTHON_HOST_PLATFORM; \
     site=/usr/lib/python3.14/site-packages; \
     python3 /usr/local/bin/pack_wheel.py \
         --from-apk "${site}" \

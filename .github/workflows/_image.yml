@@ -205,7 +205,9 @@ jobs:
           target: artifacts
           platforms: ${{ matrix.platform }}
           outputs: type=local,dest=./dist
-          build-args: ${{ steps.args.outputs.build_args }}
+          build-args: |
+            ${{ steps.args.outputs.build_args }}
+            PYTHON_HOST_PLATFORM=${{ matrix.python_host_platform }}
           provenance: false
           cache-from: type=gha,scope=onnxruntime-${{ matrix.group }}${{ inputs.cache_bust }}
           cache-to: type=gha,mode=max,scope=onnxruntime-${{ matrix.group }}${{ inputs.cache_bust }},ignore-error=true
@@ -320,7 +322,9 @@ jobs:
           outputs: |
             ${{ format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.IMAGE) }}
             ${{ format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.GHCR_IMAGE) }}
-          build-args: ${{ steps.args.outputs.build_args }}
+          build-args: |
+            ${{ steps.args.outputs.build_args }}
+            PYTHON_HOST_PLATFORM=${{ matrix.python_host_platform }}
           provenance: false
           cache-from: type=gha,scope=onnxruntime-${{ matrix.group }}${{ inputs.cache_bust }}
           cache-to: type=gha,mode=max,scope=onnxruntime-${{ matrix.group }}-runtime${{ inputs.cache_bust }},ignore-error=true
