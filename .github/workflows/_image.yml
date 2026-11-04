@@ -240,7 +240,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
     permissions:
-      contents: read
+      contents: write      # 上传 Release 资产
       packages: write
     strategy:
       fail-fast: false
@@ -474,7 +474,7 @@ jobs:
     # 都不发布，也不做「部分成功就先发一半」）③ 平台集合完整（见下一步）
     if: ${{ !cancelled() && needs.build.result == 'success' && needs.smoke.result == 'success' }}
     permissions:
-      contents: read
+      contents: write      # 上传 Release 资产
       packages: write
     steps:
       - name: Checkout
@@ -581,3 +581,45 @@ jobs:
           python3 .github/workflows/scripts/verify_manifests.py
           # ghcr 上的 manifest 也要验：两个 registry 内容一致，平台集合必须相同
           IMAGE="$GHCR_IMAGE" python3 .github/workflows/scripts/verify_manifests.py
+
+      - name: Publish wheels to GitHub Release
+        # 只在 tag 推送时产出：裸 Alpine 上跑 update.sh 需要 wheel，而运行期拿不到
+        # wheelhouse 镜像。资产直接从 wheelhouse 镜像里取 /wheels，不重新打包，
+        # 保证与镜像里那份逐字节一致。
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PLATFORMS: ${{ needs.plan.outputs.expected }}
+        run: |
+          set -euo pipefail
+          arch_of() {
+            case "$1" in
+              linux/amd64|linux/x86_64) echo x86_64 ;;
+              linux/arm64)              echo aarch64 ;;
+              linux/arm/v7)             echo armv7l ;;
+              linux/arm/v6)             echo armv6l ;;
+              linux/386)                echo i686 ;;
+              linux/ppc64le)            echo ppc64le ;;
+              linux/riscv64)            echo riscv64 ;;
+              linux/loong64)            echo loongarch64 ;;
+              *)                        echo "${1##*/}" ;;
+            esac
+          }
+          mkdir -p /tmp/rel
+          for plat in $(echo "$PLATFORMS" | tr ',' ' '); do
+            arch=$(arch_of "$plat")
+            echo "::group::$plat -> $arch"
+            cid=$(docker create --platform "$plat" "${IMAGE}:${VERSION}-wheelhouse" noop)
+            rm -rf "/tmp/rel/wheels-$arch"
+            docker cp "$cid:/wheels" "/tmp/rel/wheels-$arch"
+            docker rm -f "$cid" >/dev/null
+            tar -C /tmp/rel -czf "/tmp/rel/${GITHUB_REPOSITORY#*/}-wheels-$arch.tar.gz" "wheels-$arch"
+            rm -rf "/tmp/rel/wheels-$arch"
+            echo "::endgroup::"
+          done
+          ls -lh /tmp/rel
+
+          gh release view "${VERSION}" >/dev/null 2>&1 || \
+            gh release create "${VERSION}" --title "${VERSION}" \
+              --notes "Wheel 资产供裸 Alpine 部署（update.sh）使用。每个架构一个 tar.gz，内含 /wheels 的完整内容（wheel、SHA256SUMS、system-packages.txt、PEP 503 索引）。"
+          gh release upload "${VERSION}" /tmp/rel/*.tar.gz --clobber
