@@ -107,6 +107,8 @@ jobs:
       expected: ${{ steps.plan.outputs.expected }}
       full: ${{ steps.plan.outputs.full }}
     steps:
+      - name: Self-test CI scripts
+        run: python3 .github/workflows/scripts/selftest.py
       - name: Checkout
         uses: actions/checkout@v4
       - name: Check version consistency
