@@ -590,6 +590,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PLATFORMS: ${{ needs.plan.outputs.expected }}
+          # VERSION 只在那两个 step 的 env 里定义过，workflow 级没有，这里必须显式传
+          VERSION: ${{ inputs.onnx_version }}
         run: |
           set -euo pipefail
           arch_of() {
